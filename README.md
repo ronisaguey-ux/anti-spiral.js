@@ -202,6 +202,11 @@ Worth being straight about, since the failure mode of this class of plugin is si
   message is a nudge, and the agent is free to disagree.
 - **`experimental.chat.messages.transform` is an experimental opencode hook.** Built and
   verified against opencode 1.18.29; a change to that hook's contract would need a rewrite.
+- **Verified by exercising the transform directly, not by catching a live loop.** The suite
+  drives the real hook through the message shapes opencode hands it, and the running server
+  is confirmed to load the plugin without error — but no real session has yet been observed
+  looping under it. The counter file is where that shows up: a session row appears in
+  `state.json` only once a turn has been judged to be looping.
 
 ## reference/
 
