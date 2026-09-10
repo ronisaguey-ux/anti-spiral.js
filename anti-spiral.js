@@ -23,6 +23,11 @@
 // contained a tool call, it did work — the counter clears regardless of how the
 // text reads. Only consecutive turns that produce no tool call *and* loop can
 // escalate to a freeze. An agent that is working can never be frozen.
+//
+// A TURN IS COUNTED AT MOST ONCE. The transform can run twice for the same
+// assistant message (a retry, or a second request before the model answers), and
+// counting it twice would escalate a single loop straight to a halt. The message
+// id of the last counted turn is stored, and that turn is inert if seen again.
 
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import path from "node:path"
@@ -147,8 +152,27 @@ function loadState() {
   }
 }
 
+// A counter only means something for a conversation that is still running, so rows
+// nobody has touched in a month are dropped on write. Without this the file grows a
+// row per session forever. Rows written before `t` existed are kept, not deleted —
+// losing a counter is harmless, but silently resetting every live session once on
+// upgrade is exactly the kind of surprise this plugin is supposed to avoid.
+const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
+
+function pruneSessions(state) {
+  const sessions = state.sessions
+  if (!sessions) return
+  const now = Date.now()
+  for (const [id, row] of Object.entries(sessions)) {
+    if (!row || typeof row !== "object") { delete sessions[id]; continue }
+    const seen = Number.isFinite(row.t) ? row.t : now
+    if (now - seen > SESSION_TTL_MS) delete sessions[id]
+  }
+}
+
 function saveState(state) {
   try {
+    pruneSessions(state)
     mkdirSync(STATE_DIR, { recursive: true })
     writeFileSync(STATE_FILE, JSON.stringify(state), "utf8")
   } catch (_) {}
@@ -167,9 +191,9 @@ function lastAssistantTurn(messages) {
       .filter(p => p && ["text", "thinking", "reasoning"].includes(p.type))
       .map(p => p.text || p.thinking || p.reasoning || p.content || "")
       .join("\n")
-    return { text, usedTool }
+    return { text, usedTool, msgID: (msg.info && msg.info.id) || "" }
   }
-  return { text: "", usedTool: false }
+  return { text: "", usedTool: false, msgID: "" }
 }
 
 function uniqueID(prefix) {
@@ -253,27 +277,36 @@ export async function AntiSpiral(_input) {
         if (!state.sessions) state.sessions = {}
         if (!state.sessions[sessionID]) state.sessions[sessionID] = { loops: 0 }
         const s = state.sessions[sessionID]
+        s.t = Date.now() // last-seen stamp; pruneSessions() drops stale rows
 
-        const { text, usedTool } = lastAssistantTurn(output.messages)
+        const { text, usedTool, msgID } = lastAssistantTurn(output.messages)
 
         // Progress clears the counter: the assistant did something, whatever it wrote.
         if (usedTool) {
-          if (s.loops > 0) {
+          if (s.loops > 0 || s.lastMsg) {
             s.loops = 0
+            s.lastMsg = ""
             saveState(state)
           }
           return
         }
 
+        // This exact turn has already been judged. Re-running the transform on it
+        // (a retry, or a second request before the model answers) must not count it
+        // again, or one loop would escalate as if it were three.
+        if (msgID && msgID === s.lastMsg) return
+
         const evidence = detectSpiral(text)
         if (evidence) {
           s.loops++
+          s.lastMsg = msgID
           saveState(state)
           console.log(`[anti-spiral] loop #${s.loops} (session=${sessionID}, ${evidence.kind})`)
           const msg = s.loops >= FREEZE_AFTER ? freezeMsg(s.loops, evidence) : redirectMsg(s.loops, evidence)
           output.messages.push(syntheticMsg(msg, output.messages))
         } else if (s.loops > 0) {
           s.loops = 0
+          s.lastMsg = ""
           saveState(state)
         }
       } catch (err) {

@@ -11,7 +11,7 @@
 // ANTI_SPIRAL_PLUGIN overrides which copy of the plugin is exercised; by default
 // it is the one this repo ships.
 
-import { mkdtempSync, writeFileSync, mkdirSync, rmSync } from "node:fs"
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync } from "node:fs"
 import { fileURLToPath } from "node:url"
 import os from "node:os"
 import path from "node:path"
@@ -34,8 +34,13 @@ function check(name, got, want) {
   console.log(`${ok ? "PASS" : "FAIL"}  ${name}  (flagged=${got}, expected=${want})`)
 }
 
-function asst(parts) {
-  return { info: { role: "assistant", id: "m1", agent: "build", model: { providerID: "p", modelID: "m" } }, parts }
+// Every assistant message gets its own id, the way opencode does it: the plugin
+// counts a turn at most once per message id, so reusing one id for three different
+// turns would make them look like the same turn re-processed.
+let msgSeq = 0
+function asst(parts, id) {
+  return { info: { role: "assistant", id: id || `m${++msgSeq}`,
+                   agent: "build", model: { providerID: "p", modelID: "m" } }, parts }
 }
 function user(text) {
   return { info: { role: "user", id: "u1", agent: "build", model: { providerID: "p", modelID: "m" } },
@@ -143,6 +148,17 @@ const r2 = await run("t-reset", [user("x"), asst([{ type: "text", text: "loop. "
 check("first loop shows 1/3", r1.text.includes("loop 1/3"), true)
 check("counter reset after a tool call", r2.text.includes("loop 1/3"), true)
 
+// ── the same turn, processed twice (a retry) ───────────────────────────────
+console.log("\n== one turn, one count ==")
+
+// The identical message array, so the identical assistant message id — exactly what
+// a retried request hands the transform.
+const sameTurn = [user("x"), asst([{ type: "text", text: "I need to think about how to proceed here. ".repeat(12) }])]
+const dup1 = await run("t-dup", sameTurn)
+const dup2 = await run("t-dup", sameTurn)
+check("first pass flags the turn", dup1.text.includes("loop 1/3"), true)
+check("re-processing the same turn is inert", dup2.injected, false)
+
 // ── escalation across three consecutive looping turns ──────────────────────
 console.log("\n== escalation ==")
 const loopMsg = { type: "text", text: "I need to think about how to proceed here. ".repeat(12) }
@@ -160,6 +176,19 @@ writeFileSync(path.join(STATE_DIR, "state.json"),
   JSON.stringify({ "some-session": { consecutiveSpirals: 7 } })) // v1 schema, frozen
 const stale = await run("t-stale", [user("x"), asst([{ type: "text", text: "A short normal answer here." }])])
 check("old frozen counter does not leak in", stale.injected, false)
+
+// ── session rows nobody has touched ────────────────────────────────────────
+console.log("\n== stale session rows ==")
+const day = 24 * 60 * 60 * 1000
+writeFileSync(path.join(STATE_DIR, "state.json"), JSON.stringify({ v: 2, sessions: {
+  "t-long-gone": { loops: 2, t: Date.now() - 40 * day },
+  "t-still-live": { loops: 1, t: Date.now() - 60 * 1000 },
+} }))
+await run("t-prune", [user("x"), asst([{ type: "text", text: "loop. ".repeat(40) }])])
+const pruned = JSON.parse(readFileSync(path.join(STATE_DIR, "state.json"), "utf8"))
+check("row idle past the TTL is dropped", "t-long-gone" in pruned.sessions, false)
+check("recent row survives", pruned.sessions["t-still-live"]?.loops, 1)
+check("the session just seen is recorded", pruned.sessions["t-prune"]?.loops, 1)
 
 console.log(`\n${pass} passed, ${fail} failed`)
 rmSync(STATE_DIR, { recursive: true, force: true })

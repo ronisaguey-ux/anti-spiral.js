@@ -49,16 +49,17 @@ the load by checking the log for a load failure (there should be none):
 grep "failed to load plugin" ~/.local/share/opencode/log/opencode.log | tail
 ```
 
-Requires a plugin whose default export carries both keys the loader checks — `server` for
-the server loader and `tui` for the TUI loader:
+The default export must carry the key belonging to the loader that reads the file — `server`
+for the server, which scans `plugins/*.js`, and `tui` for anything listed in `tui.json`:
 
 ```js
-export default { id: "anti.spiral", server: AntiSpiral }
+export default { id: "anti.spiral", server: AntiSpiral }   // server-side only, by design
 ```
 
-That is not cosmetic. The server loader scans `plugins/*.js` and throws
-`Plugin … must default export an object with server()` if the key is absent, so a file with
-only `tui` (a TUI-only plugin) logs an error on every boot.
+That is not cosmetic. The server loader throws `Plugin … must default export an object with
+server()` when the key is missing, so a TUI-only plugin (a `tui` key and no `server`) dropped
+into `plugins/` logs a load error on every boot and contributes nothing. This plugin has no
+TUI half — it hooks a server-side transform — so `server` alone is what it should export.
 
 ## How detection works
 
@@ -103,6 +104,11 @@ if (usedTool) { /* clear the counter and return */ }
 An agent that is calling tools is, by definition, not stuck, so it can never be frozen.
 Only consecutive turns that produce **no tool call and repeating text** escalate.
 
+A turn is also counted **at most once**, keyed by the message id of the turn that was
+judged. The transform can run twice for the same assistant message — a retried request, or
+a second request issued before the model answers — and counting it twice would escalate a
+single loop as if it were three. A turn that has already been judged is left alone.
+
 ## Escalation
 
 | Consecutive loops | Injected |
@@ -126,13 +132,20 @@ ${ANTI_SPIRAL_STATE_DIR:-~/.local/share/opencode/anti-spiral}/state.json
 ```
 
 ```json
-{ "v": 2, "sessions": { "<sessionID>": { "loops": 1 } } }
+{ "v": 2, "sessions": { "<sessionID>": { "loops": 1, "lastMsg": "msg_abc", "t": 1757500000000 } } }
 ```
 
 Keyed by session id, falling back to `"default"`. The `v` field is a version stamp: state
 written by the old detector carries a counter that may already be at freeze, so an
 unrecognised version discards it rather than inheriting its verdict. `ANTI_SPIRAL_STATE_DIR`
 relocates the file (the test suite uses it to stay hermetic).
+
+`lastMsg` is the message id of the last turn counted, which is what makes a retried turn
+inert; `t` is when that session was last seen. Rows idle for more than `SESSION_TTL_MS`
+(30 days) are dropped when the file is written, so the file does not accumulate one row per
+session forever. Losing a row costs nothing — a counter is only meaningful for a
+conversation that is still running — and a row written before `t` existed is kept rather
+than deleted, so an upgrade does not reset every live session once.
 
 ## Tuning
 
@@ -143,6 +156,7 @@ At the top of `anti-spiral.js`:
 | `FREEZE_AFTER` | `3` | consecutive loops before the halt message |
 | `MIN_WORDS` | `40` | messages shorter than this are never inspected |
 | `STATE_VERSION` | `2` | bump to invalidate every stored counter |
+| `SESSION_TTL_MS` | 30 days | idle session rows are dropped on write |
 
 Coverage thresholds live in the `[8,7,6,5,4,3]` loop in `detectSpiral()`.
 
@@ -152,7 +166,7 @@ Coverage thresholds live in the `[8,7,6,5,4,3]` loop in `detectSpiral()`.
 node test/anti-spiral.test.mjs
 ```
 
-15 cases, driving the real module through synthetic message arrays. The suite sets
+20 cases, driving the real module through synthetic message arrays. The suite sets
 `ANTI_SPIRAL_STATE_DIR` to a temp dir before importing, so it never touches a live
 session's counters. `ANTI_SPIRAL_PLUGIN=/path/to/anti-spiral.js` points it at a different
 copy (useful for testing an installed plugin against this suite).
@@ -165,8 +179,15 @@ It asserts both directions, which is the whole point:
   ERROR lines, prose that reuses common phrases, a short message, an empty message.
 - **progress wins** — repetitive text that also contains a tool call is not flagged, and a
   loop → tool call → loop sequence restarts the counter at 1 instead of continuing to 2.
+- **one turn, one count** — the same assistant message put through the transform twice (a
+  retry) is counted once; the second pass injects nothing.
 - **escalation** — turns 1 and 2 redirect, turn 3 halts.
 - **stale state** — a counter written in the v1 schema does not leak in.
+- **stale session rows** — a row idle past the TTL is dropped on write while a recent row
+  and the row for the session being processed both survive.
+
+Every case that guards a specific line of logic was checked by mutation: deleting the
+same-turn guard or the pruning call fails exactly its own test and nothing else.
 
 ## Limitations
 
@@ -190,4 +211,4 @@ loaded by anything — do not install it.
 
 ## Licence
 
-No licence file — all rights reserved.
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 ronisaguey-ux.
