@@ -178,22 +178,50 @@ function saveState(state) {
   } catch (_) {}
 }
 
+// Does this part represent a tool call? Different opencode builds have used
+// "tool", "tool-invocation" and "tool-call"; some nest the tool under a step.
+function isToolPart(p) {
+  if (!p) return false
+  if (p.type === "tool" || p.type === "tool-invocation" || p.type === "tool-call") return true
+  if (p.type === "step-start" && p.tool) return true
+  if (p.tool && p.state) return true
+  return false
+}
+
 // The text the assistant produced last, plus whether that turn did any work.
-// A tool part means real progress was made, which clears the loop counter.
+// A tool part anywhere in the turn means real progress was made, which clears
+// the loop counter.
+//
+// A single agent turn is not one message. opencode emits a step-start, the tool
+// call, the tool result, then a final text message — all under the same turn, and
+// only the LAST of them is the assistant's closing text. Checking just that last
+// message missed every tool call made earlier in the turn, so an agent that was
+// working flat out (a tool call in every turn) still looked like it was narrating,
+// and the counter marched to a freeze. That is the bug this version fixes: scan
+// the whole turn — every assistant message back to the preceding user message —
+// and treat the turn as work if ANY of them carries a tool call.
 function lastAssistantTurn(messages) {
+  let lastIdx = -1
   for (let i = messages.length - 1; i >= 0; i--) {
-    const msg = messages[i]
-    if (!msg?.info || msg.info.role !== "assistant") continue
-    const parts = msg.parts || []
-    const usedTool = parts.some(p => p && (p.type === "tool" || p.type === "tool-invocation" ||
-      (p.type === "step-start" && p.tool)))
-    const text = parts
-      .filter(p => p && ["text", "thinking", "reasoning"].includes(p.type))
-      .map(p => p.text || p.thinking || p.reasoning || p.content || "")
-      .join("\n")
-    return { text, usedTool, msgID: (msg.info && msg.info.id) || "" }
+    if (messages[i]?.info?.role === "assistant") { lastIdx = i; break }
   }
-  return { text: "", usedTool: false, msgID: "" }
+  if (lastIdx < 0) return { text: "", usedTool: false, msgID: "" }
+
+  let usedTool = false
+  for (let i = lastIdx; i >= 0; i--) {
+    const msg = messages[i]
+    if (!msg?.info) continue
+    if (msg.info.role === "user") break // start of this turn; stop here
+    if (msg.info.role !== "assistant") continue
+    if ((msg.parts || []).some(isToolPart)) { usedTool = true; break }
+  }
+
+  const last = messages[lastIdx]
+  const text = (last.parts || [])
+    .filter(p => p && ["text", "thinking", "reasoning"].includes(p.type))
+    .map(p => p.text || p.thinking || p.reasoning || p.content || "")
+    .join("\n")
+  return { text, usedTool, msgID: (last.info && last.info.id) || "" }
 }
 
 function uniqueID(prefix) {

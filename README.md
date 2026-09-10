@@ -104,6 +104,15 @@ if (usedTool) { /* clear the counter and return */ }
 An agent that is calling tools is, by definition, not stuck, so it can never be frozen.
 Only consecutive turns that produce **no tool call and repeating text** escalate.
 
+**A turn is not one message.** opencode emits a step-start, the tool call, the tool
+result, then a closing text message — all under the same turn, and only the last of them
+is the assistant's text. The first version of this check looked at that last message
+alone, so a tool call made earlier in the turn was invisible: an agent calling a tool in
+every single turn still looked like it was narrating, and the counter marched to a freeze.
+That was the bug behind the false freezes. `lastAssistantTurn()` now walks the whole turn
+— every assistant message back to the preceding user message — and the turn counts as
+work if **any** of them carries a tool call.
+
 A turn is also counted **at most once**, keyed by the message id of the turn that was
 judged. The transform can run twice for the same assistant message — a retried request, or
 a second request issued before the model answers — and counting it twice would escalate a

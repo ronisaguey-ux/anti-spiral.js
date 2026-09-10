@@ -138,6 +138,19 @@ const withTool = await run("t-tool", [
 ])
 check("repetitive text BUT a tool call was made", withTool.injected, false)
 
+// The real shape of an agent turn: the tool call and the closing text are
+// SEPARATE assistant messages. Only the last one carries text; the tool call sits
+// earlier in the same turn. Inspecting only the last message missed it, so an
+// agent working flat out still counted as narrating and marched to a freeze.
+const splitTurn = await run("t-split", [
+  user("x"),
+  asst([{ type: "tool", tool: "bash", state: { status: "completed" } }]),
+  { info: { role: "tool", id: "tr1", agent: "build", model: { providerID: "p", modelID: "m" } },
+    parts: [{ type: "text", text: "tool output" }] },
+  asst([{ type: "text", text: "loop. ".repeat(40) }]),
+])
+check("tool call earlier in the same turn (separate message)", splitTurn.injected, false)
+
 // loop -> tool -> loop: the counter must be back at 1, not 2
 const r1 = await run("t-reset", [user("x"), asst([{ type: "text", text: "loop. ".repeat(40) }])])
 await run("t-reset", [user("x"), asst([
