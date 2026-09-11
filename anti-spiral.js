@@ -1,53 +1,71 @@
-// anti-spiral.js — opencode plugin: catches genuine reasoning loops and redirects them.
+// anti-spiral.js — opencode plugin: catches genuine reasoning loops and stops them.
 //
-// WHAT A REAL LOOP IS: the same *substantial* unit — a sentence, a phrase of five or
-// more words, a whole line of prose — repeated three or more times, and repeated
-// densely enough that the repetition dominates the message instead of merely
-// appearing in it. Ordinary technical writing reuses short bigrams constantly
-// ("the file", "of the", "in the"); that is not a loop, and treating it as one is
-// what made the previous version fire on every turn until agents learned to ignore it.
+// v3. Two independent layers, because v2 had one and it missed a 26,000-character
+// "Let me go. / Let me read." spiral in a single DeepSeek reasoning stream:
 //
-// DETECTION (all checks run on prose only — fenced code, inline code, tables and
-// tool output are stripped first, because logs and listings repeat lines legitimately):
-//   1. Same sentence (>= 8 words) twice in a row — a hard loop signature.
+//   LAYER 1 — MID-STREAM KILL SWITCH (the `event` hook)
+//     Every streamed reasoning/text delta of an ASSISTANT message is watched. When
+//     the tail of the stream is dominated by a repeated unit, the session is aborted
+//     right there (client.session.abort) and a redirect is sent as the next user
+//     message. A spiral is cut at a few hundred characters instead of running to the
+//     provider's output-token limit. v2 only had the transform hook, which runs
+//     *before the next request* — it cannot touch a generation already in flight.
+//
+//   LAYER 2 — TURN REVIEW (the `experimental.chat.messages.transform` hook)
+//     Before each request the previous assistant turn is judged. A loop injects a
+//     redirect with the evidence; three consecutive looping turns without a tool call
+//     escalate to a halt. v2 skipped this entirely when the turn contained a tool
+//     call, so a reasoning stream that looped 20x and then emitted one Read counted
+//     as "progress" — and grew, turn by turn, into the 1006x spiral. Now a tool call
+//     still resets the ESCALATION, but a loop is still reported.
+//
+// WHAT A REAL LOOP IS: the same substantial unit — a sentence, a phrase, a line —
+// repeated enough that the repetition DOMINATES a window of text. Ordinary prose
+// reuses short phrases; that is not a loop. Five signatures are checked:
+//   1. Same sentence (>30 chars) twice in a row.
 //   2. Same prose line (>= 6 words) three or more times.
-//   3. N-gram coverage: an n-gram (n = 3..8) occurring >= 3x AND covering at least
-//      a threshold share of the whole message. Longer units need less coverage
-//      (n>=5: 30%, n=4: 40%, n=3: 55%); short units must dominate to count.
+//   3. N-gram dominance over the whole message (n = 3..8, >= 3x, coverage threshold).
+//   4. The stall tic: a line of <= 4 words ("Let me go.", "(Run.)", "OK.") standing on
+//      its own >= 4 times. Every real spiral examined started this way.
+//   5. TAIL dominance: the last ~150 words are >= 60% one repeated n-gram (n = 2..10,
+//      >= 4x), or the last 12 lines are short and have <= 4 distinct values. This is
+//      the live-spiral signature — the message may be long and mostly fine, and the
+//      loop is what it has degenerated into at the end. v2 dropped this check and
+//      a 1,000-word reasoning that ended in 20 "Let me read / Let me go" lines
+//      scored 16% coverage: invisible.
 //
-// ESCALATION:
-//   - loop 1-2: a redirect with the evidence (which phrase, how many times)
-//   - loop 3+:  a hard stop — one tool call, no narration
+// Code, logs, tables and tool output are stripped before measuring, because those
+// repeat lines for legitimate reasons.
 //
-// THE COUNTER RESETS ON PROGRESS, NOT ON PHRASING. If the assistant's last turn
-// contained a tool call, it did work — the counter clears regardless of how the
-// text reads. Only consecutive turns that produce no tool call *and* loop can
-// escalate to a freeze. An agent that is working can never be frozen.
+// Session identity comes from the messages themselves (info.sessionID): the transform
+// hook's input is `{}` in opencode 1.18, so v2's `hookInput.session.id` was always
+// undefined and every session shared one counter named "default".
 //
-// A TURN IS COUNTED AT MOST ONCE. The transform can run twice for the same
-// assistant message (a retry, or a second request before the model answers), and
-// counting it twice would escalate a single loop straight to a halt. The message
-// id of the last counted turn is stored, and that turn is inert if seen again.
+// A turn is counted at most once (by assistant message id). State is per session,
+// pruned after 30 idle days.
 
 import { readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import path from "node:path"
 import os from "node:os"
 
-// ANTI_SPIRAL_STATE_DIR relocates the counter file. The test suite points it at a
-// temp dir so a run never touches a real session's counters, and anyone who keeps
-// state outside $HOME can set it too.
+const VERSION = "v3"
 const STATE_DIR =
   process.env.ANTI_SPIRAL_STATE_DIR ||
   path.join(os.homedir(), ".local", "share", "opencode", "anti-spiral")
 const STATE_FILE = path.join(STATE_DIR, "state.json")
-const STATE_VERSION = 2 // bump invalidates counters written by the old detector
+const STATE_VERSION = 3 // bump invalidates counters written by an older detector
 const FREEZE_AFTER = 3
 const MIN_WORDS = 40
 
+// Mid-stream: don't judge a stream before it has this much text, then re-check
+// every STREAM_STEP characters of growth (cheap: the check is O(tail)).
+const STREAM_MIN_CHARS = Number(process.env.ANTI_SPIRAL_STREAM_MIN_CHARS) || 400
+const STREAM_STEP = 200
+const TAIL_WORDS = 150
+const TAIL_LINES = 12
+
 // ── prose extraction ───────────────────────────────────────────────────────
 
-// Everything that repeats itself for legitimate reasons: code, logs, tables,
-// file listings, shell transcripts. Dropped before any repetition is measured.
 function stripNonProse(text) {
   return text
     .replace(/```[\s\S]*?```/g, "\n")            // fenced code blocks
@@ -58,11 +76,18 @@ function stripNonProse(text) {
     .replace(/^\s*[>#]+\s?/gm, "")               // quote / heading markers
 }
 
+// A stream in flight may have an open code fence with no closing one yet; drop
+// everything from that fence so a log being quoted is not judged as prose.
+function stripStreaming(text) {
+  const fences = (text.match(/```/g) || []).length
+  if (fences % 2 === 1) text = text.slice(0, text.lastIndexOf("```"))
+  return stripNonProse(text)
+}
+
 function isProseLine(line) {
   if (!line) return false
   const words = line.split(/\s+/).filter(Boolean)
   if (words.length < 6) return false
-  // Lines that are mostly symbols, paths, flags or code punctuation are not prose.
   const symbolish = (line.match(/[{}()[\];=<>|\\/_$@#*`~^]/g) || []).length
   if (symbolish / line.length > 0.18) return false
   const letters = (line.match(/[A-Za-z]/g) || []).length
@@ -86,8 +111,7 @@ function sentencesOf(text) {
 
 // ── detection ──────────────────────────────────────────────────────────────
 
-// Max occurrences of any n-gram, plus the share of the message that occurrence
-// covers. Coverage is what separates "a loop" from "prose that reuses a phrase".
+// Max occurrences of any n-gram over `words`, and the share of `words` covered.
 function ngramCoverage(words, n) {
   if (words.length < n * 3) return { best: null, count: 0, coverage: 0 }
   const counts = new Map()
@@ -100,6 +124,70 @@ function ngramCoverage(words, n) {
     if (c > bestCount) { bestCount = c; best = g }
   }
   return { best, count: bestCount, coverage: (bestCount * n) / words.length }
+}
+
+// The stall tic: a short line ("Let me go.", "(Run.)", "OK.") standing on its own,
+// over and over. In every real spiral examined it was the first symptom — a
+// reasoning stream that was otherwise varied, punctuated by "Let me go." between
+// every thought, before it collapsed into pure repetition. Nothing legitimate
+// repeats a four-word line `minCount` times.
+function detectTic(lines, minCount) {
+  const counts = new Map()
+  let best = null
+  for (const raw of lines) {
+    // Labels ("old:", "user: ..."), transcript prefixes and lines where inline code
+    // was stripped out (they leave a double space) are structure, not narration.
+    if (/:\s*$/.test(raw) || /^(user|assistant|system|old|new|before|after)\s*:/i.test(raw)) continue
+    if (raw.includes("  ")) continue
+    if (!/[.!?)]$/.test(raw)) continue // a tic is a sentence-shaped line
+    const key = raw.toLowerCase().replace(/[^a-z0-9 ]/g, " ").trim().replace(/\s+/g, " ")
+    const words = key.split(" ").filter(Boolean)
+    if (words.length === 0 || words.length > 4) continue
+    if (words.some(w => /\d/.test(w))) continue // "step 3", "line 42": numbered, not a tic
+    // "Let me ..." is THE narration tic and is held to the base threshold; any other
+    // short line ("Hmm.", "OK.", "Done.") needs two more repeats to count.
+    const need = key.startsWith("let me") ? minCount : minCount + 2
+    const c = (counts.get(key) || 0) + 1
+    counts.set(key, c)
+    if (c >= need && (!best || c > best.count)) best = { kind: "tic", phrase: raw.trim().slice(0, 60), count: c }
+  }
+  return best
+}
+
+// The live-spiral signature: the END of the text is one unit over and over.
+// Works on raw text (reasoning streams have no code fences worth stripping, and
+// stripping is applied by the caller where it matters).
+function detectTailLoop(text) {
+  if (!text) return null
+  const lines = text.split("\n").map(l => l.trim()).filter(Boolean)
+  // (a) the same short line six or more times in the last 40 lines.
+  const tic = detectTic(lines.slice(-40), 6)
+  if (tic) return { ...tic, coverage: tic.count / Math.min(lines.length, 40) }
+  // (b) short lines with almost no variety: "Let me go." / "Let me read." / "OK."
+  if (lines.length >= TAIL_LINES) {
+    const tail = lines.slice(-TAIL_LINES)
+    const short = tail.every(l => l.split(/\s+/).length <= 8)
+    const distinct = new Set(tail.map(l => l.toLowerCase().replace(/[^a-z0-9 ]/g, "").trim()))
+    // <= 4 distinct values over 12 lines: a 2-, 3- or 4-line cycle repeated three
+    // times or more ("OK. / (Run.) / Let me read. / Let me do it." was a 4-cycle).
+    if (short && distinct.size <= 4) {
+      const counts = new Map()
+      for (const l of tail) counts.set(l, (counts.get(l) || 0) + 1)
+      const [phrase, count] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]
+      return { kind: "tail", phrase: phrase.slice(0, 140), count, coverage: count / tail.length }
+    }
+  }
+  // (c) one n-gram dominating the last TAIL_WORDS words.
+  const words = normalizeWords(text)
+  if (words.length < 60) return null
+  const tail = words.slice(-TAIL_WORDS)
+  for (const n of [10, 9, 8, 7, 6, 5, 4, 3, 2]) {
+    const { best, count, coverage } = ngramCoverage(tail, n)
+    if (count >= 4 && coverage >= 0.6) {
+      return { kind: "tail", phrase: best, count, coverage }
+    }
+  }
+  return null
 }
 
 // Returns null when the text is not a loop, otherwise the evidence for the redirect.
@@ -119,8 +207,10 @@ function detectSpiral(rawText) {
     }
   }
 
-  // 2. The same line of prose three or more times.
-  const lines = text.split("\n").map(l => l.trim()).filter(isProseLine)
+  // 2. The same line of prose three or more times. Quotations are exempt: a
+  //    summary that restates `user: "..."` three times is quoting, not looping.
+  const allLines = text.split("\n").map(l => l.trim()).filter(Boolean)
+  const lines = allLines.filter(isProseLine).filter(l => !/^["'\u201c]|:\s*["\u201c]/.test(l))
   const lineCounts = new Map()
   for (const l of lines) {
     const key = l.toLowerCase().replace(/\s+/g, " ")
@@ -129,7 +219,11 @@ function detectSpiral(rawText) {
     if (c >= 3) return { kind: "line", phrase: l.slice(0, 140), count: c }
   }
 
-  // 3. N-gram dominance — the main check. Longer units need less coverage.
+  // 3. The stall tic: a short line on its own, four or more times.
+  const tic = detectTic(allLines, 4)
+  if (tic) return { ...tic, coverage: tic.count / allLines.length }
+
+  // 4. N-gram dominance over the whole message.
   for (const n of [8, 7, 6, 5, 4, 3]) {
     const threshold = n >= 5 ? 0.30 : n === 4 ? 0.40 : 0.55
     const { best, count, coverage } = ngramCoverage(words, n)
@@ -138,10 +232,11 @@ function detectSpiral(rawText) {
     }
   }
 
-  return null
+  // 5. The tail has degenerated into a loop even if the whole message has not.
+  return detectTailLoop(text)
 }
 
-// ── helpers ────────────────────────────────────────────────────────────────
+// ── state ──────────────────────────────────────────────────────────────────
 
 function loadState() {
   try {
@@ -152,11 +247,6 @@ function loadState() {
   }
 }
 
-// A counter only means something for a conversation that is still running, so rows
-// nobody has touched in a month are dropped on write. Without this the file grows a
-// row per session forever. Rows written before `t` existed are kept, not deleted —
-// losing a counter is harmless, but silently resetting every live session once on
-// upgrade is exactly the kind of surprise this plugin is supposed to avoid.
 const SESSION_TTL_MS = 30 * 24 * 60 * 60 * 1000
 
 function pruneSessions(state) {
@@ -178,8 +268,22 @@ function saveState(state) {
   } catch (_) {}
 }
 
-// Does this part represent a tool call? Different opencode builds have used
-// "tool", "tool-invocation" and "tool-call"; some nest the tool under a step.
+function sessionRow(state, sessionID) {
+  if (state.v !== STATE_VERSION) {
+    state.v = STATE_VERSION
+    state.sessions = {}
+  }
+  if (!state.sessions) state.sessions = {}
+  if (!state.sessions[sessionID]) state.sessions[sessionID] = { loops: 0, aborts: 0 }
+  const s = state.sessions[sessionID]
+  if (!Number.isFinite(s.loops)) s.loops = 0
+  if (!Number.isFinite(s.aborts)) s.aborts = 0
+  s.t = Date.now()
+  return s
+}
+
+// ── message helpers ────────────────────────────────────────────────────────
+
 function isToolPart(p) {
   if (!p) return false
   if (p.type === "tool" || p.type === "tool-invocation" || p.type === "tool-call") return true
@@ -188,18 +292,15 @@ function isToolPart(p) {
   return false
 }
 
-// The text the assistant produced last, plus whether that turn did any work.
-// A tool part anywhere in the turn means real progress was made, which clears
-// the loop counter.
-//
-// A single agent turn is not one message. opencode emits a step-start, the tool
-// call, the tool result, then a final text message — all under the same turn, and
-// only the LAST of them is the assistant's closing text. Checking just that last
-// message missed every tool call made earlier in the turn, so an agent that was
-// working flat out (a tool call in every turn) still looked like it was narrating,
-// and the counter marched to a freeze. That is the bug this version fixes: scan
-// the whole turn — every assistant message back to the preceding user message —
-// and treat the turn as work if ANY of them carries a tool call.
+function partText(p) {
+  if (!p || !["text", "thinking", "reasoning"].includes(p.type)) return ""
+  return p.text || p.thinking || p.reasoning || p.content || ""
+}
+
+// The last assistant turn: every assistant message back to the preceding user
+// message. `text` is ALL reasoning/text in the turn (a loop that lives in the
+// reasoning of an earlier step is still a loop), `usedTool` is whether any message
+// in the turn carried a tool call, `msgID` identifies the closing message.
 function lastAssistantTurn(messages) {
   let lastIdx = -1
   for (let i = messages.length - 1; i >= 0; i--) {
@@ -208,50 +309,57 @@ function lastAssistantTurn(messages) {
   if (lastIdx < 0) return { text: "", usedTool: false, msgID: "" }
 
   let usedTool = false
+  const chunks = []
   for (let i = lastIdx; i >= 0; i--) {
     const msg = messages[i]
     if (!msg?.info) continue
-    if (msg.info.role === "user") break // start of this turn; stop here
+    if (msg.info.role === "user") break
     if (msg.info.role !== "assistant") continue
-    if ((msg.parts || []).some(isToolPart)) { usedTool = true; break }
+    const parts = msg.parts || []
+    if (parts.some(isToolPart)) usedTool = true
+    const t = parts.map(partText).filter(Boolean).join("\n")
+    if (t) chunks.unshift(t)
   }
-
   const last = messages[lastIdx]
-  const text = (last.parts || [])
-    .filter(p => p && ["text", "thinking", "reasoning"].includes(p.type))
-    .map(p => p.text || p.thinking || p.reasoning || p.content || "")
-    .join("\n")
-  return { text, usedTool, msgID: (last.info && last.info.id) || "" }
+  return { text: chunks.join("\n"), usedTool, msgID: (last.info && last.info.id) || "" }
+}
+
+function sessionOf(messages) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const id = messages[i]?.info?.sessionID
+    if (id) return id
+  }
+  return "default"
 }
 
 function uniqueID(prefix) {
   return `${prefix}_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 10)}`
 }
 
-function syntheticMsg(text, messages) {
+function syntheticMsg(text, messages, sessionID) {
   const lastUser = [...messages].reverse().find(m => m?.info?.role === "user" && m?.info?.model)
   const agent = lastUser?.info?.agent || "build"
   const model = lastUser?.info?.model || { providerID: "", modelID: "" }
   const id = uniqueID("spiral")
   return {
-    info: { role: "user", id, sessionID: "", time: { created: Date.now() }, agent, model },
+    info: { role: "user", id, sessionID, time: { created: Date.now() }, agent, model },
     parts: [{
       id: uniqueID("sp"),
-      sessionID: "", messageID: id,
+      sessionID, messageID: id,
       type: "text", text, synthetic: true, ignored: false,
     }],
   }
 }
 
 // ── redirect messages ──────────────────────────────────────────────────────
-// Operational tone, and always carries the evidence: an agent that is shown the
-// exact phrase it repeated can act on it. Grandstanding gets filtered as noise.
 
 function describe(evidence) {
   if (evidence.kind === "sentence") return `the same sentence twice in a row: "${evidence.phrase}"`
   if (evidence.kind === "line") return `this line ${evidence.count}x: "${evidence.phrase}"`
-  const pct = Math.round(evidence.coverage * 100)
-  return `"${evidence.phrase}" repeated ${evidence.count}x (${pct}% of the message)`
+  if (evidence.kind === "tic") return `the line "${evidence.phrase}" on its own ${evidence.count}x — narrating the next step instead of taking it`
+  const pct = Math.round((evidence.coverage || 0) * 100)
+  const where = evidence.kind === "tail" ? " of the end of the message" : " of the message"
+  return `"${evidence.phrase}" repeated ${evidence.count}x (${pct}%${where})`
 }
 
 function redirectMsg(count, evidence) {
@@ -265,7 +373,8 @@ Do exactly one of these, in this turn:
   2. If the same step has now failed twice, stop repeating it — change the approach, or
      state the blocker and what you need from the user in one line.
 
-Do not restate the plan. Do not re-explain what you are about to do. Act.
+Do not restate the plan. Do not re-explain what you are about to do. Do not write
+"let me" — call the tool. Act.
 
 (loop ${count}/${FREEZE_AFTER} — three consecutive turns with no tool call and repeated
 text will halt narration until a tool call is made.)`
@@ -286,54 +395,138 @@ If you genuinely cannot proceed, say so in one sentence and stop. That is a vali
 outcome — repeating the same reasoning is not.`
 }
 
-// ── plugin export ──────────────────────────────────────────────────────────
+function abortMsg(count, evidence) {
+  return `[anti-spiral] Your previous response was cut off mid-stream: it had degenerated into
+a loop — ${describe(evidence)} — and was going nowhere.
 
-export async function AntiSpiral(_input) {
-  console.log("[anti-spiral] loaded — loop detector v2 (progress-aware, code-aware)")
+Everything before the loop still stands. Resume from there with ONE concrete action:
+the tool call you were about to make (read the file, run the command, make the edit).
+Emit the tool call directly. No "let me", no restating what you are about to do.
+
+If you cannot decide what the next step is, say what is blocking you in one sentence
+and stop.
+
+(mid-stream cut ${count} — repeated cuts without a tool call will halt this session.)`
+}
+
+// ── plugin ─────────────────────────────────────────────────────────────────
+
+export async function AntiSpiral(input) {
+  const client = input?.client
+  console.log(`[anti-spiral] loaded — loop detector ${VERSION} (mid-stream kill switch + turn review)`)
+
+  // Layer 1 bookkeeping. roles: messageID -> role (assistant parts are the only ones
+  // judged; a user pasting a spiral into the prompt must never abort their own
+  // session). streams: partID -> last length judged. cut: messageIDs already aborted.
+  const roles = new Map()
+  const streams = new Map()
+  const cut = new Set()
+  const bound = (m, max) => { if (m.size > max) { const first = m.keys().next().value; m.delete(first) } }
+
+  async function cutStream(part, evidence) {
+    const sessionID = part.sessionID
+    const messageID = part.messageID
+    if (!sessionID || !messageID || cut.has(messageID)) return
+    cut.add(messageID); bound(cut, 500)
+
+    const state = loadState()
+    const s = sessionRow(state, sessionID)
+    s.aborts += 1
+    s.loops += 1
+    s.lastMsg = messageID
+    saveState(state)
+    console.log(`[anti-spiral] MID-STREAM CUT #${s.aborts} (session=${sessionID}, msg=${messageID}, ${evidence.count}x "${String(evidence.phrase).slice(0, 60)}")`)
+
+    if (!client) return
+    try {
+      await client.session.abort({ path: { id: sessionID } })
+    } catch (err) {
+      console.error("[anti-spiral] abort failed:", String(err?.message || err))
+      return
+    }
+    try {
+      await client.tui.showToast({ body: {
+        title: "anti-spiral", variant: "warning", duration: 6000,
+        message: `Cut a reasoning loop (${evidence.count}x "${String(evidence.phrase).slice(0, 40)}") and redirected.`,
+      } })
+    } catch (_) {}
+    // Give the abort a moment to settle before the redirect opens a new turn.
+    await new Promise(r => setTimeout(r, 400))
+    const text = s.loops >= FREEZE_AFTER ? freezeMsg(s.loops, evidence) : abortMsg(s.aborts, evidence)
+    try {
+      await client.session.prompt({ path: { id: sessionID }, body: { parts: [{ type: "text", text }] } })
+    } catch (err) {
+      console.error("[anti-spiral] redirect prompt failed:", String(err?.message || err))
+    }
+  }
+
   return {
-    "experimental.chat.messages.transform": async (hookInput, output) => {
+    event: async ({ event }) => {
+      try {
+        if (!event) return
+        if (event.type === "message.updated") {
+          const info = event.properties?.info
+          if (info?.id && info.role) { roles.set(info.id, info.role); bound(roles, 2000) }
+          return
+        }
+        if (event.type !== "message.part.updated") return
+        const part = event.properties?.part
+        if (!part || (part.type !== "reasoning" && part.type !== "text")) return
+        if (roles.get(part.messageID) !== "assistant") return
+        if (cut.has(part.messageID)) return
+        const text = partText(part)
+        if (part.time?.end) { streams.delete(part.id); return } // finished: layer 2 owns it now
+        if (text.length < STREAM_MIN_CHARS) return
+        const seen = streams.get(part.id) || 0
+        if (text.length - seen < STREAM_STEP) return
+        streams.set(part.id, text.length); bound(streams, 500)
+        const evidence = detectTailLoop(stripStreaming(text))
+        if (evidence) await cutStream(part, evidence)
+      } catch (err) {
+        try { console.error("[anti-spiral] event error:", String(err?.message || err)) } catch (_) {}
+      }
+    },
+
+    "experimental.chat.messages.transform": async (_hookInput, output) => {
       try {
         if (!output || !Array.isArray(output.messages)) return
-        const sessionID = hookInput?.session?.id || "default"
+        const sessionID = sessionOf(output.messages)
         const state = loadState()
-        // A state file written by the old detector carries a counter that is
-        // already at freeze — start clean instead of inheriting its verdict.
-        if (state.v !== STATE_VERSION) {
-          state.v = STATE_VERSION
-          state.sessions = {}
-        }
-        if (!state.sessions) state.sessions = {}
-        if (!state.sessions[sessionID]) state.sessions[sessionID] = { loops: 0 }
-        const s = state.sessions[sessionID]
-        s.t = Date.now() // last-seen stamp; pruneSessions() drops stale rows
+        const s = sessionRow(state, sessionID)
 
         const { text, usedTool, msgID } = lastAssistantTurn(output.messages)
 
-        // Progress clears the counter: the assistant did something, whatever it wrote.
+        // This exact turn has already been judged (a retry, or a second request
+        // before the model answered, or a mid-stream cut that already counted it).
+        if (msgID && msgID === s.lastMsg) return
+
+        const evidence = detectSpiral(text)
+
         if (usedTool) {
-          if (s.loops > 0 || s.lastMsg) {
-            s.loops = 0
-            s.lastMsg = ""
-            saveState(state)
+          // Work happened: escalation resets. A loop in the turn is still called out
+          // — silently clearing it is how the "let me read" habit grew 5x -> 1006x —
+          // but as a one-off redirect that cannot escalate to a halt on its own.
+          s.loops = 0
+          s.aborts = 0
+          s.lastMsg = evidence ? msgID : ""
+          saveState(state)
+          if (evidence) {
+            console.log(`[anti-spiral] loop alongside a tool call (session=${sessionID}, ${evidence.kind}) — redirect, no escalation`)
+            output.messages.push(syntheticMsg(redirectMsg(1, evidence), output.messages, sessionID))
           }
           return
         }
 
-        // This exact turn has already been judged. Re-running the transform on it
-        // (a retry, or a second request before the model answers) must not count it
-        // again, or one loop would escalate as if it were three.
-        if (msgID && msgID === s.lastMsg) return
-
-        const evidence = detectSpiral(text)
         if (evidence) {
           s.loops++
           s.lastMsg = msgID
           saveState(state)
           console.log(`[anti-spiral] loop #${s.loops} (session=${sessionID}, ${evidence.kind})`)
           const msg = s.loops >= FREEZE_AFTER ? freezeMsg(s.loops, evidence) : redirectMsg(s.loops, evidence)
-          output.messages.push(syntheticMsg(msg, output.messages))
-        } else if (s.loops > 0) {
+          output.messages.push(syntheticMsg(msg, output.messages, sessionID))
+        } else if (s.loops > 0 || s.aborts > 0) {
           s.loops = 0
+          s.aborts = 0
           s.lastMsg = ""
           saveState(state)
         }
@@ -344,4 +537,5 @@ export async function AntiSpiral(_input) {
   }
 }
 
+export { detectSpiral, detectTailLoop }
 export default { id: "anti.spiral", server: AntiSpiral }

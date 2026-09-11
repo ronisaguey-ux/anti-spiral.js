@@ -24,8 +24,18 @@ process.env.ANTI_SPIRAL_STATE_DIR = STATE_DIR // must precede the import below
 const pluginPath = process.env.ANTI_SPIRAL_PLUGIN || path.join(here, "..", "anti-spiral.js")
 const { AntiSpiral } = await import(pluginPath)
 
-const plugin = await AntiSpiral({})
+// A fake opencode client: records aborts / prompts / toasts instead of doing them.
+const calls = { abort: [], prompt: [], toast: [] }
+const client = {
+  session: {
+    abort: async (o) => { calls.abort.push(o.path.id) },
+    prompt: async (o) => { calls.prompt.push({ id: o.path.id, text: o.body.parts[0].text }) },
+  },
+  tui: { showToast: async (o) => { calls.toast.push(o.body.message) } },
+}
+const plugin = await AntiSpiral({ client })
 const transform = plugin["experimental.chat.messages.transform"]
+const onEvent = plugin.event
 
 let pass = 0, fail = 0
 function check(name, got, want) {
@@ -46,10 +56,13 @@ function user(text) {
   return { info: { role: "user", id: "u1", agent: "build", model: { providerID: "p", modelID: "m" } },
            parts: [{ type: "text", text }] }
 }
+// The transform hook's input is `{}` in opencode 1.18: session identity has to come
+// from the messages, so every message is stamped the way the server stamps them.
 async function run(sessionID, messages) {
-  const out = { messages: [...messages] }
-  await transform({ session: { id: sessionID } }, out)
-  const injected = out.messages.length > messages.length
+  const stamped = messages.map(m => ({ ...m, info: { ...m.info, sessionID } }))
+  const out = { messages: [...stamped] }
+  await transform({}, out)
+  const injected = out.messages.length > stamped.length
   return { injected, text: injected ? out.messages[out.messages.length - 1].parts[0].text : "" }
 }
 
@@ -131,12 +144,11 @@ console.log("\n== progress-aware counter ==")
 const withTool = await run("t-tool", [
   user("x"),
   asst([
-    { type: "text", text: "Let me proceed. Let me proceed. Let me proceed. Let me proceed. " +
-                          "Let me proceed. Let me proceed. Let me proceed. Let me proceed." },
+    { type: "text", text: "Let me proceed. ".repeat(20) },
     { type: "tool", tool: "read", state: { status: "completed" } },
   ]),
 ])
-check("repetitive text BUT a tool call was made", withTool.injected, false)
+check("repetitive text alongside a tool call: reported, not escalated", withTool.injected, true)
 
 // The real shape of an agent turn: the tool call and the closing text are
 // SEPARATE assistant messages. Only the last one carries text; the tool call sits
@@ -149,7 +161,16 @@ const splitTurn = await run("t-split", [
     parts: [{ type: "text", text: "tool output" }] },
   asst([{ type: "text", text: "loop. ".repeat(40) }]),
 ])
-check("tool call earlier in the same turn (separate message)", splitTurn.injected, false)
+// v3: the tool call still resets ESCALATION, but the loop is still called out —
+// silently clearing it is how a 5x habit grew into a 1006x spiral.
+check("tool call earlier in the same turn: loop still reported", splitTurn.injected, true)
+check("  ...but as a non-escalating redirect (1/3)", splitTurn.text.includes("loop 1/3"), true)
+const splitClean = await run("t-split-clean", [
+  user("x"),
+  asst([{ type: "tool", tool: "bash", state: { status: "completed" } }]),
+  asst([{ type: "text", text: "The build passes now; the failing import was the stale symlink in dist, which I removed." }]),
+])
+check("tool call + clean closing text stays silent", splitClean.injected, false)
 
 // loop -> tool -> loop: the counter must be back at 1, not 2
 const r1 = await run("t-reset", [user("x"), asst([{ type: "text", text: "loop. ".repeat(40) }])])
@@ -160,6 +181,91 @@ await run("t-reset", [user("x"), asst([
 const r2 = await run("t-reset", [user("x"), asst([{ type: "text", text: "loop. ".repeat(40) }])])
 check("first loop shows 1/3", r1.text.includes("loop 1/3"), true)
 check("counter reset after a tool call", r2.text.includes("loop 1/3"), true)
+
+// ── the real spiral shapes from the 2026-09-10 DeepSeek session ────────────
+console.log("\n== real-world spirals ==")
+const letMeGo = "Let me go.\n\nLet me read.\n\n"
+const real1 = await run("t-real1", [user("x"), asst([
+  { type: "reasoning", text: "Now I have enough. Let me check the rpc.py API for the keyless provider.\n\n" + letMeGo.repeat(60) },
+])])
+check("'Let me go / Let me read' x60 in a reasoning part", real1.injected, true)
+
+// 1,000 words of ordinary reasoning that degenerates into 20 short lines at the end:
+// whole-message coverage is ~16%, only the tail check sees it.
+// ~1,000 words of varied, ordinary reasoning (no sentence repeats).
+const longClean = Array.from({ length: 60 }, (_, i) =>
+  `Step ${i + 1}: the parser reads record ${i + 1} and checks its length field against the remaining buffer, ` +
+  `so a truncated frame at offset ${i * 64} is rejected before anything is copied into the output. `).join("")
+const real2 = await run("t-real2", [user("x"), asst([
+  { type: "reasoning", text: longClean + "OK.\n\n(Run.)\n\nLet me read.\n\nLet me do it.\n\n".repeat(6) },
+  { type: "tool", tool: "read", state: { status: "completed" } },
+])])
+check("long clean reasoning that ends in a short-line loop (+ a tool call)", real2.injected, true)
+check("  ...the evidence names the tic", real2.text.includes("narrating the next step instead of taking it"), true)
+
+const real3 = await run("t-real3", [user("x"), asst([
+  { type: "reasoning", text: longClean + "Enough deliberation. I will read waitForResponse now, lines 1891 to 1990, and then decide." },
+])])
+check("long clean reasoning with a normal ending stays silent", real3.injected, false)
+
+// ── session identity comes from the messages, not the hook input ───────────
+console.log("\n== session identity ==")
+const sidLoop = { type: "text", text: "I need to think about how to proceed here. ".repeat(12) }
+await run("t-sid-A", [user("x"), asst([sidLoop])])
+await run("t-sid-A", [user("x"), asst([sidLoop])])
+const other = await run("t-sid-B", [user("x"), asst([sidLoop])])
+check("a different session starts at 1/3, not 3/3", other.text.includes("loop 1/3"), true)
+const stateNow = JSON.parse(readFileSync(path.join(STATE_DIR, "state.json"), "utf8"))
+check("state is keyed by the real session id", "t-sid-A" in stateNow.sessions && !("default" in stateNow.sessions), true)
+
+// ── layer 1: the mid-stream kill switch ────────────────────────────────────
+console.log("\n== mid-stream kill switch ==")
+async function stream(sessionID, messageID, role, type, chunks) {
+  await onEvent({ event: { type: "message.updated", properties: { info: { id: messageID, role, sessionID } } } })
+  let text = ""
+  const partID = `p-${messageID}`
+  for (const c of chunks) {
+    text += c
+    await onEvent({ event: { type: "message.part.updated", properties: {
+      part: { id: partID, messageID, sessionID, type, text, time: { start: 1 } }, delta: c } } })
+  }
+}
+const before = calls.abort.length
+await stream("s-live", "m-live", "assistant", "reasoning",
+  ["Now I have enough. Let me check the rpc.py API.\n\n", ...Array(40).fill(letMeGo)])
+check("streaming 'Let me go / Let me read' aborts the session", calls.abort.length, before + 1)
+check("  ...the abort targets the right session", calls.abort.at(-1), "s-live")
+check("  ...a redirect prompt follows", calls.prompt.at(-1)?.text.includes("[anti-spiral]") && calls.prompt.at(-1)?.text.includes("cut off mid-stream"), true)
+check("  ...and the TUI gets a toast", calls.toast.length > 0, true)
+
+// Cut once per message: more deltas for the same message do nothing.
+await stream("s-live", "m-live", "assistant", "reasoning", [letMeGo.repeat(80)])
+check("the same message is not aborted twice", calls.abort.length, before + 1)
+
+// A USER pasting a spiral into the prompt must never abort their own session.
+const b2 = calls.abort.length
+await stream("s-user", "m-user", "user", "text", [letMeGo.repeat(80)])
+check("a user message containing a spiral is ignored", calls.abort.length, b2)
+
+// A log quoted inside an open code fence is not a loop, even mid-stream.
+await stream("s-log", "m-log", "assistant", "text",
+  ["The retries all fail the same way:\n\n```\n", ..."ERROR connection refused\n".repeat(30).split(/(?<=\n)/)])
+check("streaming a repeated log line inside an open code fence is ignored", calls.abort.length, b2)
+
+// Normal long reasoning streams untouched.
+await stream("s-clean", "m-clean", "assistant", "reasoning", longClean.match(/.{1,200}/g))
+check("normal long reasoning streams untouched", calls.abort.length, b2)
+
+// A finished part is layer 2's business, not layer 1's.
+await onEvent({ event: { type: "message.updated", properties: { info: { id: "m-done", role: "assistant", sessionID: "s-done" } } } })
+await onEvent({ event: { type: "message.part.updated", properties: { part: {
+  id: "p-done", messageID: "m-done", sessionID: "s-done", type: "reasoning", text: letMeGo.repeat(80), time: { start: 1, end: 2 } } } } })
+check("a part that has already ended is not aborted", calls.abort.length, b2)
+
+// Escalation: after the cut, the next transform sees the aborted turn once and the
+// counter that the cut already bumped is not bumped again.
+const afterCut = await run("s-live", [user("x"), asst([{ type: "reasoning", text: letMeGo.repeat(60) }], "m-live")])
+check("the cut turn is not counted a second time by the transform", afterCut.injected, false)
 
 // ── the same turn, processed twice (a retry) ───────────────────────────────
 console.log("\n== one turn, one count ==")
@@ -193,7 +299,7 @@ check("old frozen counter does not leak in", stale.injected, false)
 // ── session rows nobody has touched ────────────────────────────────────────
 console.log("\n== stale session rows ==")
 const day = 24 * 60 * 60 * 1000
-writeFileSync(path.join(STATE_DIR, "state.json"), JSON.stringify({ v: 2, sessions: {
+writeFileSync(path.join(STATE_DIR, "state.json"), JSON.stringify({ v: 3, sessions: {
   "t-long-gone": { loops: 2, t: Date.now() - 40 * day },
   "t-still-live": { loops: 1, t: Date.now() - 60 * 1000 },
 } }))

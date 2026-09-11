@@ -33,7 +33,43 @@ in its own transcript can see it repeating identically every turn. The observed 
 an agent narrating *"The SPIRAL FREEZE block is injected noise — I should ignore its
 demands and just do the work properly."* A guardrail that is always on is not a guardrail.
 
-This is the rewrite: it fires on real loops, and it is silent otherwise.
+Version 2 fixed that and then missed a real one. On 2026-09-10 a DeepSeek session produced
+a 26,669-character reasoning stream that was `Let me go. / Let me read.` repeated **1,006
+times**, ending only when the provider hit its output-token limit. v2 never logged a word,
+for three reasons that are each fixed in v3:
+
+1. **It could not see a generation in flight.** Its only hook, `chat.messages.transform`,
+   runs *before the next request*. A spiral inside one response is invisible to it until
+   that response ends, and nothing it does can shorten one.
+2. **A tool call anywhere in the turn cleared everything.** The spirals before the big one
+   were 5×, 16×, 20× in reasoning streams that then emitted one `read` — "progress", so no
+   redirect, ever. The habit grew unchecked from 5× to 1006×.
+3. **Coverage was measured over the whole message.** A 1,000-word reasoning that ends in 20
+   short looping lines has 16% coverage. Invisible. The loop is what the text *degenerates
+   into*, so the tail has to be judged on its own.
+
+It also keyed every session under the name `"default"`, because the transform hook's input
+is `{}` in opencode 1.18 and `hookInput.session.id` was always undefined.
+
+## What v3 does
+
+Two independent layers:
+
+**Layer 1 — mid-stream kill switch** (`event` hook). Every streamed `reasoning`/`text`
+delta of an *assistant* message is watched (`message.part.updated`). When the tail of the
+stream is dominated by a repeated unit, the plugin calls `client.session.abort()` right
+there, shows a TUI toast, and sends a redirect as the next user message so the agent resumes
+from the last real thought with one concrete action. A spiral is cut at a few hundred
+characters instead of tens of thousands. User messages are never judged (a user pasting a
+spiral into the prompt must not abort their own session), and a message is cut at most once.
+
+**Layer 2 — turn review** (`experimental.chat.messages.transform`). Before each request the
+previous assistant turn — *all* reasoning and text in it, back to the preceding user
+message — is judged. A loop injects a redirect with the evidence. A tool call in the turn
+still resets the **escalation**, but the loop is still reported as a one-off redirect that
+cannot escalate on its own. Three consecutive looping turns with no tool call halt.
+
+
 
 ## Install
 
@@ -42,97 +78,68 @@ cp anti-spiral.js ~/.config/opencode/plugins/
 systemctl --user restart opencode-serve.service     # plugins are cached at serve boot
 ```
 
-Editing a file under `plugins/` does **not** take effect until the server restarts. Confirm
-the load by checking the log for a load failure (there should be none):
+Editing a file under `plugins/` does **not** take effect until the server restarts. `openbot`
+(the launcher in this setup) restarts the serve automatically when the installed plugin is
+newer than the running process, and prints which detector version loaded. Confirm by hand:
 
 ```bash
-grep "failed to load plugin" ~/.local/share/opencode/log/opencode.log | tail
+journalctl --user -u opencode-serve.service --since "5 min ago" | grep "anti-spiral"
+#  [anti-spiral] loaded — loop detector v3 (mid-stream kill switch + turn review)
 ```
 
 The default export must carry the key belonging to the loader that reads the file — `server`
-for the server, which scans `plugins/*.js`, and `tui` for anything listed in `tui.json`:
+for the server, which scans `plugins/*.js`:
 
 ```js
-export default { id: "anti.spiral", server: AntiSpiral }   // server-side only, by design
+export default { id: "anti.spiral", server: AntiSpiral }
 ```
-
-That is not cosmetic. The server loader throws `Plugin … must default export an object with
-server()` when the key is missing, so a TUI-only plugin (a `tui` key and no `server`) dropped
-into `plugins/` logs a load error on every boot and contributes nothing. This plugin has no
-TUI half — it hooks a server-side transform — so `server` alone is what it should export.
 
 ## How detection works
 
 Everything is measured on **prose only**. Fenced blocks, `~~~` blocks, inline code,
 markdown table rows, list bullets and quote/heading markers are stripped first, because
-code and logs repeat themselves for legitimate reasons. A line then has to look like prose
-to count at all: at least six words, fewer than 18% symbol characters, more than 55%
-letters.
+code and logs repeat themselves for legitimate reasons. Mid-stream, an *unclosed* fence is
+dropped from the fence onward, so a log being quoted is never judged before its closing
+fence arrives.
 
-Three checks, in order:
+Five checks, in order:
 
 | # | Check | Fires when |
 |---|---|---|
 | 1 | Identical sentence | the same sentence (longer than 30 chars) appears twice **in a row** |
-| 2 | Identical prose line | the same ≥6-word line appears **3×** or more |
-| 3 | N-gram dominance | an n-gram for n=3..8 appears ≥3× **and** covers enough of the message |
+| 2 | Identical prose line | the same ≥6-word line appears **3×** or more (quotations exempt) |
+| 3 | Stall tic | a sentence-shaped line of ≤4 words stands on its own ≥4× if it starts with "let me", ≥6× otherwise (`Hmm.`, `OK.`, `(Run.)`) |
+| 4 | N-gram dominance | an n-gram for n=3..8 appears ≥3× **and** covers enough of the message (n≥5: 30%, 4: 40%, 3: 55%) |
+| 5 | Tail dominance | the last 12 lines are all short with ≤4 distinct values, or one n-gram (n=2..10, ≥4×) covers ≥60% of the last 150 words |
 
-Check 3 is the workhorse, and *coverage* is what separates a loop from ordinary writing
-that reuses a phrase. An n-gram that simply appears three times in a long answer is not a
-loop; an n-gram that appears three times and occupies most of the message is. Longer units
-need less coverage, short units must dominate:
+Check 3 is the early-warning one. In every real spiral examined it was the first symptom: a
+varied, sensible reasoning stream punctuated by `Let me go.` between thoughts, before it
+collapsed into pure repetition. Nothing legitimate repeats a four-word line that often.
+Labels (`old:`), transcript prefixes (`user: …`) and numbered lines (`step 3.`) are
+excluded.
 
-| n | required coverage |
-|---|---|
-| 8, 7, 6, 5 | 30% |
-| 4 | 40% |
-| 3 | 55% |
+Check 5 is what the mid-stream layer runs on every 200 characters of growth once a part has
+400 characters, together with the stall tic at a higher bar (≥6× / ≥8× in the last 40
+lines).
 
-Messages shorter than `MIN_WORDS = 40` are never flagged, so a terse but repetitive
-one-liner does not trip anything.
+Messages shorter than `MIN_WORDS = 40` are never inspected by layer 2.
 
-## The counter resets on progress, not on phrasing
-
-This is the fix for the 24/7 freeze. If the assistant's last turn contained a **tool
-call**, the loop counter clears immediately — regardless of how the text reads:
-
-```js
-const { text, usedTool } = lastAssistantTurn(output.messages)
-if (usedTool) { /* clear the counter and return */ }
-```
-
-An agent that is calling tools is, by definition, not stuck, so it can never be frozen.
-Only consecutive turns that produce **no tool call and repeating text** escalate.
-
-**A turn is not one message.** opencode emits a step-start, the tool call, the tool
-result, then a closing text message — all under the same turn, and only the last of them
-is the assistant's text. The first version of this check looked at that last message
-alone, so a tool call made earlier in the turn was invisible: an agent calling a tool in
-every single turn still looked like it was narrating, and the counter marched to a freeze.
-That was the bug behind the false freezes. `lastAssistantTurn()` now walks the whole turn
-— every assistant message back to the preceding user message — and the turn counts as
-work if **any** of them carries a tool call.
-
-A turn is also counted **at most once**, keyed by the message id of the turn that was
-judged. The transform can run twice for the same assistant message — a retried request, or
-a second request issued before the model answers — and counting it twice would escalate a
-single loop as if it were three. A turn that has already been judged is left alone.
+Replayed against 961 real assistant reasoning/text parts from this machine's session
+database: all 31 parts containing a known spiral are caught, and every additional flag
+examined by hand was a genuine stall (`Let me run.` ×24, `Let me output.` ×31, `Hmm.` ×14).
 
 ## Escalation
 
-| Consecutive loops | Injected |
+| Situation | Injected |
 |---|---|
-| 1–2 | a redirect naming the exact repeated unit, with two concrete options: run the next step as a tool call, or — if the same step has now failed twice — change approach or state the blocker in one line |
-| 3+ (`FREEZE_AFTER`) | a halt: narration is paused until a tool call happens, with three suggestions and an explicit "if you genuinely cannot proceed, say so in one sentence and stop" |
+| mid-stream cut | abort + toast + a redirect: "your previous response was cut off mid-stream … resume with ONE concrete action, emit the tool call directly" |
+| loop, turn had a tool call | a non-escalating redirect (`loop 1/3`) naming the repeated unit |
+| loops 1–2, no tool call | a redirect with the evidence and two options: act, or state the blocker in one line |
+| 3+ consecutive (`FREEZE_AFTER`) | a halt: narration paused until a tool call happens |
 
-Both messages carry the **evidence** — which phrase, how many times, what share of the
-message — so the agent can act on it instead of guessing what it did wrong. There is no
-shaming language and no all-caps verdict, deliberately: text an agent learns to skim is
-text that does not work.
-
-The message is injected as a synthetic user message through `output.messages.push(...)`,
-so it appears in the model's context without being written to the session's stored
-history as a real turn.
+Mid-stream cuts count toward the same counter, so repeated cuts without a tool call reach
+the halt too. A turn is counted **at most once** (by assistant message id), and a turn the
+kill switch already counted is not counted again by the turn review.
 
 ## State
 
@@ -141,33 +148,23 @@ ${ANTI_SPIRAL_STATE_DIR:-~/.local/share/opencode/anti-spiral}/state.json
 ```
 
 ```json
-{ "v": 2, "sessions": { "<sessionID>": { "loops": 1, "lastMsg": "msg_abc", "t": 1757500000000 } } }
+{ "v": 3, "sessions": { "<sessionID>": { "loops": 1, "aborts": 0, "lastMsg": "msg_abc", "t": 1757500000000 } } }
 ```
 
-Keyed by session id, falling back to `"default"`. The `v` field is a version stamp: state
-written by the old detector carries a counter that may already be at freeze, so an
-unrecognised version discards it rather than inheriting its verdict. `ANTI_SPIRAL_STATE_DIR`
-relocates the file (the test suite uses it to stay hermetic).
-
-`lastMsg` is the message id of the last turn counted, which is what makes a retried turn
-inert; `t` is when that session was last seen. Rows idle for more than `SESSION_TTL_MS`
-(30 days) are dropped when the file is written, so the file does not accumulate one row per
-session forever. Losing a row costs nothing — a counter is only meaningful for a
-conversation that is still running — and a row written before `t` existed is kept rather
-than deleted, so an upgrade does not reset every live session once.
+Keyed by the session id read from the messages' `info.sessionID`. `v` is a version stamp:
+state written by an older detector is discarded rather than inherited. Rows idle for more
+than 30 days are dropped on write.
 
 ## Tuning
 
-At the top of `anti-spiral.js`:
-
 | Constant | Default | Effect |
 |---|---|---|
-| `FREEZE_AFTER` | `3` | consecutive loops before the halt message |
-| `MIN_WORDS` | `40` | messages shorter than this are never inspected |
-| `STATE_VERSION` | `2` | bump to invalidate every stored counter |
-| `SESSION_TTL_MS` | 30 days | idle session rows are dropped on write |
-
-Coverage thresholds live in the `[8,7,6,5,4,3]` loop in `detectSpiral()`.
+| `FREEZE_AFTER` | `3` | consecutive loops (turns or cuts) before the halt message |
+| `MIN_WORDS` | `40` | turn-review minimum |
+| `STREAM_MIN_CHARS` | `400` (env `ANTI_SPIRAL_STREAM_MIN_CHARS`) | mid-stream: text length before the first check |
+| `STREAM_STEP` | `200` | mid-stream: re-check every N characters of growth |
+| `TAIL_WORDS` / `TAIL_LINES` | `150` / `12` | size of the tail window |
+| `STATE_VERSION` | `3` | bump to invalidate every stored counter |
 
 ## Tests
 
@@ -175,47 +172,28 @@ Coverage thresholds live in the `[8,7,6,5,4,3]` loop in `detectSpiral()`.
 node test/anti-spiral.test.mjs
 ```
 
-20 cases, driving the real module through synthetic message arrays. The suite sets
-`ANTI_SPIRAL_STATE_DIR` to a temp dir before importing, so it never touches a live
-session's counters. `ANTI_SPIRAL_PLUGIN=/path/to/anti-spiral.js` points it at a different
-copy (useful for testing an installed plugin against this suite).
-
-It asserts both directions, which is the whole point:
-
-- **must fire** — a phrase repeated 4×, an identical sentence repeated, a repeated
-  reasoning stream.
-- **must stay silent** — a code block with repeating lines, a log dump with 12 identical
-  ERROR lines, prose that reuses common phrases, a short message, an empty message.
-- **progress wins** — repetitive text that also contains a tool call is not flagged, and a
-  loop → tool call → loop sequence restarts the counter at 1 instead of continuing to 2.
-- **one turn, one count** — the same assistant message put through the transform twice (a
-  retry) is counted once; the second pass injects nothing.
-- **escalation** — turns 1 and 2 redirect, turn 3 halts.
-- **stale state** — a counter written in the v1 schema does not leak in.
-- **stale session rows** — a row idle past the TTL is dropped on write while a recent row
-  and the row for the session being processed both survive.
-
-Every case that guards a specific line of logic was checked by mutation: deleting the
-same-turn guard or the pruning call fails exactly its own test and nothing else.
+39 cases driving the real module — the transform hook through synthetic message arrays, and
+the event hook through a streamed sequence of `message.part.updated` events against a fake
+client that records `abort`/`prompt`/`showToast` calls. Covers: the three real spiral shapes
+from the 2026-09-10 session (the 1006× stream, a 1,000-word reasoning ending in a short-line
+loop next to a tool call, the same with a normal ending), session identity from messages,
+the mid-stream cut (fires on the right session, once per message, never on a user message,
+never inside an open code fence, never on a finished part, never on normal long reasoning),
+the tool-call-does-not-hide-a-loop rule, one-turn-one-count, escalation, stale state and
+TTL pruning.
 
 ## Limitations
 
-Worth being straight about, since the failure mode of this class of plugin is silent:
-
-- **Only the last assistant turn is inspected.** A loop spread thinly across many turns
-  with varying phrasing is not detected.
-- **The halt is advisory.** It asks for a tool call; it cannot compel one. Nothing here can
-  prevent a model from narrating further — it changes what the model sees, not what it can do.
-- **Heuristics, not understanding.** A pathological message that repeats a long phrase three
-  times for a legitimate reason (quoting a spec back, for instance) will be flagged. The
-  message is a nudge, and the agent is free to disagree.
-- **`experimental.chat.messages.transform` is an experimental opencode hook.** Built and
-  verified against opencode 1.18.29; a change to that hook's contract would need a rewrite.
-- **Verified by exercising the transform directly, not by catching a live loop.** The suite
-  drives the real hook through the message shapes opencode hands it, and the running server
-  is confirmed to load the plugin without error — but no real session has yet been observed
-  looping under it. The counter file is where that shows up: a session row appears in
-  `state.json` only once a turn has been judged to be looping.
+- **The halt is advisory; the cut is not.** Layer 2 changes what the model sees. Layer 1
+  actually aborts the generation — which also discards any tool call the model was about
+  to emit after the loop. The redirect asks for exactly that tool call, so the cost is one
+  wasted generation, but it is a real intervention and it is deliberate.
+- **Heuristics, not understanding.** A message that legitimately repeats a short line six
+  times will be flagged. The redirect is a nudge and the agent may disagree.
+- **`experimental.chat.messages.transform` and the `event` payload shapes are opencode
+  1.18.29 contracts.** A change to either needs a rewrite; the test suite pins both.
+- **Mid-stream detection needs streamed part updates.** A provider/path that delivers the
+  whole part in one update is only caught by layer 2, after the fact.
 
 ## reference/
 
