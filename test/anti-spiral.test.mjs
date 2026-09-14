@@ -262,6 +262,29 @@ await onEvent({ event: { type: "message.part.updated", properties: { part: {
   id: "p-done", messageID: "m-done", sessionID: "s-done", type: "reasoning", text: letMeGo.repeat(80), time: { start: 1, end: 2 } } } } })
 check("a part that has already ended is not aborted", calls.abort.length, b2)
 
+// The 09-14 regression: the role map is fed by `message.updated`, and when that
+// event never arrived the old gate (`role !== "assistant"` -> return) skipped every
+// part in silence — the journal showed a 15-minute spiral and zero cuts. Reasoning
+// is assistant by construction, so it is judged even with no role event at all.
+const b5 = calls.abort.length
+async function part(p) { await onEvent({ event: { type: "message.part.updated", properties: { part: { time: { start: 1 }, ...p } } } }) }
+let grown = ""
+for (let i = 0; i < 40; i++) {
+  grown += letMeGo
+  await part({ id: "p-norole", messageID: "m-norole", sessionID: "s-norole", type: "reasoning", text: grown })
+}
+check("reasoning with no role event at all is still cut", calls.abort.length, b5 + 1)
+
+// An unknown-role TEXT part is different: without growth it is a user paste, and a
+// user must never have their own session aborted.
+const b6 = calls.abort.length
+await part({ id: "p-static", messageID: "m-static", sessionID: "s-static", type: "text", text: letMeGo.repeat(80) })
+await part({ id: "p-static", messageID: "m-static", sessionID: "s-static", type: "text", text: letMeGo.repeat(80) })
+check("a static unknown-role text part is not cut", calls.abort.length, b6)
+await part({ id: "p-growing", messageID: "m-growing", sessionID: "s-growing", type: "text", text: "seed" })
+await part({ id: "p-growing", messageID: "m-growing", sessionID: "s-growing", type: "text", text: letMeGo.repeat(80) })
+check("an unknown-role text part that grows IS cut", calls.abort.length, b6 + 1)
+
 // Escalation: after the cut, the next transform sees the aborted turn once and the
 // counter that the cut already bumped is not bumped again.
 const afterCut = await run("s-live", [user("x"), asst([{ type: "reasoning", text: letMeGo.repeat(60) }], "m-live")])
@@ -288,6 +311,45 @@ check("turn 1 -> redirect", e1.text.includes("[anti-spiral]") && !e1.text.includ
 check("turn 2 -> redirect", e2.text.includes("loop 2/3"), true)
 check("turn 3 -> halt", e3.text.includes("HALT"), true)
 
+// ── v4: the 09-14 spiral — a loop that keeps making tool calls ─────────────
+console.log("\n== tool-call spiral (2026-09-14) ==")
+// The shape that ran for 15 minutes: a turn of "Let me act." tics PLUS a tool
+// call, every 20 seconds. v3 let the tool call reset the escalation counter, so
+// the session was detected 18 times and halted zero times.
+const ticTurn = () => [user("x"), asst([
+  { type: "text", text: "Let me act. ".repeat(6) },
+  { type: "tool", tool: "bash", state: { status: "completed" } },
+])]
+const s1 = await run("t-spiral", ticTurn())
+const s2 = await run("t-spiral", ticTurn())
+const s3 = await run("t-spiral", ticTurn())
+check("looping tool turn 1 -> redirect", s1.text.includes("loop 1/3"), true)
+check("looping tool turn 3 -> halt (v3 never got here)", s3.text.includes("HALT"), true)
+
+// ── v4: the rate trip — detections that keep getting their counter reset ───
+console.log("\n== rate trip ==")
+// Every loop below is followed by a clean turn, which resets the consecutive
+// counters. v3's spirals survived exactly this way; the rate trip counts
+// detections in a rolling window instead, so it cannot be reset away.
+const cleanTurn = (i) => [user("x"), asst([{ type: "text",
+  text: `The failing import was the stale symlink in dist; removed it and the suite is green (run ${i}).` }])]
+const rates = []
+for (let i = 1; i <= 5; i++) {
+  await run("t-rate", cleanTurn(i))
+  rates.push((await run("t-rate", [user("x"), asst([{ type: "text", text: "Let me act. ".repeat(12) }])])).text)
+}
+check("first four detections only redirect", rates.slice(0, 4).every(t => t.includes("[anti-spiral]") && !t.includes("HALT")), true)
+check("the fifth halts on the rate trip", rates[4].includes("HALT") && rates[4].includes("5 loops detected in the last"), true)
+
+// ── v4: a short looping turn ───────────────────────────────────────────────
+console.log("\n== short looping turn ==")
+// Below the 40-word floor a turn used to be ignored outright, so a nine-word
+// turn that was 100% repetition scored null.
+const shortLoop = await run("t-short", [user("x"), asst([{ type: "text", text: "Let me act. Let me act. Let me act." }])])
+check("a nine-word turn that is pure repetition fires", shortLoop.injected, true)
+const shortReal = await run("t-short-ok", [user("x"), asst([{ type: "text", text: "The suite is green and the branch is pushed." }])])
+check("a short ordinary answer stays silent", shortReal.injected, false)
+
 // ── state written by the previous detector version ─────────────────────────
 console.log("\n== stale state ==")
 mkdirSync(STATE_DIR, { recursive: true })
@@ -296,10 +358,18 @@ writeFileSync(path.join(STATE_DIR, "state.json"),
 const stale = await run("t-stale", [user("x"), asst([{ type: "text", text: "A short normal answer here." }])])
 check("old frozen counter does not leak in", stale.injected, false)
 
+// Counters written by an older detector carry different semantics (v3 had no
+// toolLoops and no rate trip), so a row from that version must not be resumed:
+// a v3 row already at 2/3 must not turn this session's first loop into a halt.
+writeFileSync(path.join(STATE_DIR, "state.json"),
+  JSON.stringify({ v: 3, sessions: { "t-v3": { loops: 2, t: Date.now() } } }))
+const afterV3 = await run("t-v3", [user("x"), asst([{ type: "text", text: "loop. ".repeat(40) }])])
+check("counters from an older detector version are not resumed", afterV3.text.includes("loop 1/3"), true)
+
 // ── session rows nobody has touched ────────────────────────────────────────
 console.log("\n== stale session rows ==")
 const day = 24 * 60 * 60 * 1000
-writeFileSync(path.join(STATE_DIR, "state.json"), JSON.stringify({ v: 3, sessions: {
+writeFileSync(path.join(STATE_DIR, "state.json"), JSON.stringify({ v: 4, sessions: {
   "t-long-gone": { loops: 2, t: Date.now() - 40 * day },
   "t-still-live": { loops: 1, t: Date.now() - 60 * 1000 },
 } }))

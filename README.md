@@ -54,8 +54,14 @@ plugin:
    thought with one concrete action (the tool call it was about to make).
 
 A spiral is cut at a few hundred characters instead of tens of thousands. A message is cut
-at most once. User messages are never judged — pasting a loop into the prompt must not
-abort your own session — and a part that has already finished is left to layer 2.
+at most once. Known user messages are never judged — pasting a loop into the prompt must
+not abort your own session — and a part that has already finished is left to layer 2.
+
+The role of a message is learned from `message.updated`, but a `part.updated` can arrive
+first, so text whose role is still unknown is judged only once it is seen to **grow**:
+assistant output streams and grows, a paste is written once and does not. (This is the bug
+that silently disabled the kill switch for four days — the old code required a role it had
+not yet been told, and returned early on every part.)
 
 ### Layer 2 — turn review (`experimental.chat.messages.transform`)
 
@@ -64,9 +70,17 @@ it, back to the preceding user message. A loop injects a synthetic user message 
 the evidence (which unit, how many times, what share of the text) and a short instruction:
 take the next step as a tool call, or state the blocker in one line.
 
-A tool call anywhere in the turn resets the **escalation** — an agent that is calling
-tools cannot be halted — but a loop in that turn is still reported as a one-off redirect.
-Three consecutive looping turns with no tool call escalate to a halt.
+Escalation has **two independent trips**, because a single counter is forgettable:
+
+- **Three consecutive looping turns.** A looping turn that contains a tool call counts in
+  its own counter (`toolLoops`), so an agent that keeps *narrating* the call it is about to
+  make cannot reset its way out — the 09-14 spiral did exactly that for 15 minutes while
+  every detection logged "redirect". A turn that is genuinely clean resets both counters.
+- **Five detections in five minutes** (`RATE_LIMIT` / `RATE_WINDOW_MS`). Hits are counted
+  in a rolling window and are never cleared by hand, so alternating a loop with a clean
+  turn — the pattern that survived every previous version — still trips it. The 09-14
+  spiral would have halted on its fourth turn, about 17% in, instead of running to the
+  provider's limit.
 
 Session identity is read from the messages themselves (`info.sessionID`); the transform
 hook's own input carries none. A turn is counted at most once, keyed by the assistant
@@ -104,7 +118,11 @@ Check 5 is what the mid-stream layer runs, together with the stall tic at a high
 *degenerated* into a loop at the end is caught by the tail even when whole-message
 coverage is low.
 
-Layer 2 never inspects a turn shorter than `MIN_WORDS = 40`.
+Layer 2 reviews a turn of 40 words or more with all five checks. Below that — down to
+`MIN_SHORT_WORDS = 8` — it runs a narrower check only: a repeat of an n-gram (n=2..5) that
+occurs at least three times and covers half the turn. A short turn has to be *almost
+entirely* repetition to be flagged, because at that length ordinary prose reuses words.
+Anything shorter than 8 words is ignored entirely.
 
 Replayed against 961 real assistant reasoning/text parts from a live session database: all
 31 parts containing a known spiral are caught, and every additional flag examined by hand
@@ -115,13 +133,15 @@ was a genuine stall (`Let me run.` ×24, `Let me output.` ×31, `Hmm.` ×14).
 | Situation | Injected |
 |---|---|
 | mid-stream cut | abort + toast + a redirect: "your previous response was cut off mid-stream … resume with ONE concrete action, emit the tool call directly" |
-| loop, turn had a tool call | a non-escalating redirect (`loop 1/3`) naming the repeated unit |
+| loop, turn had a tool call | a redirect (`loop n/3`, tool-call variant) naming the repeated unit |
 | loops 1–2, no tool call | a redirect with the evidence and two options: act, or state the blocker in one line |
-| 3+ consecutive (`FREEZE_AFTER`) | a halt: narration paused until a tool call happens |
+| 3+ consecutive (`FREEZE_AFTER`, either counter) | a halt: narration paused until a tool call happens |
+| 5+ detections in 5 min (`RATE_LIMIT`) | the same halt, with the rate that tripped it |
 
-Mid-stream cuts count toward the same counter, so repeated cuts without a tool call reach
-the halt too. The messages are operational and always carry the evidence — an agent shown
-the exact phrase it repeated can act on it; grandstanding gets skimmed as noise.
+Mid-stream cuts count toward the consecutive counter too, so repeated cuts without a tool
+call reach the halt as well. The messages are operational and always carry the evidence —
+an agent shown the exact phrase it repeated can act on it; grandstanding gets skimmed as
+noise.
 
 ## Install
 
@@ -135,7 +155,7 @@ the load:
 
 ```bash
 journalctl --user -u opencode-serve.service --since "5 min ago" | grep "anti-spiral"
-#  [anti-spiral] loaded — loop detector v3 (mid-stream kill switch + turn review)
+#  [anti-spiral] loaded — loop detector v4 (mid-stream kill switch + turn review, halt on 3 straight or 5 in 5min)
 ```
 
 The default export must carry the key belonging to the loader that reads the file — `server`
@@ -152,24 +172,29 @@ ${ANTI_SPIRAL_STATE_DIR:-~/.local/share/opencode/anti-spiral}/state.json
 ```
 
 ```json
-{ "v": 3, "sessions": { "<sessionID>": { "loops": 1, "aborts": 0, "lastMsg": "msg_abc", "t": 1757500000000 } } }
+{ "v": 4, "sessions": { "<sessionID>": { "loops": 1, "aborts": 0, "toolLoops": 0, "hits": [1757500000000], "lastMsg": "msg_abc", "t": 1757500000000 } } }
 ```
 
-Keyed by session id. `v` is a schema stamp: a file written by a different version is
-discarded rather than inherited. `lastMsg` is the id of the last turn counted; `t` is when
-the session was last seen. Rows idle for more than 30 days are dropped on write.
-`ANTI_SPIRAL_STATE_DIR` relocates the file (the test suite uses it to stay hermetic).
+Keyed by session id. `v` is a schema stamp enforced in `loadState` — a file written by a
+different detector version is discarded rather than resumed, because a `loops` of 2 written
+by v3 means something v4 does not agree with. `loops` counts consecutive looping turns with
+no tool call, `toolLoops` the ones that had one, `hits` is the rolling rate-trip window.
+`lastMsg` is the id of the last turn counted; `t` is when the session was last seen. Rows
+idle for more than 30 days are dropped on write. `ANTI_SPIRAL_STATE_DIR` relocates the file
+(the test suite uses it to stay hermetic).
 
 ## Tuning
 
 | Constant | Default | Effect |
 |---|---|---|
-| `FREEZE_AFTER` | `3` | consecutive loops (turns or cuts) before the halt message |
+| `FREEZE_AFTER` | `3` | consecutive loops (turns or cuts, either counter) before the halt message |
+| `RATE_LIMIT` / `RATE_WINDOW_MS` | `5` / `300000` | detections within a rolling window that halt regardless of counters |
 | `MIN_WORDS` | `40` | turn-review minimum |
+| `MIN_SHORT_WORDS` | `8` | below this a turn is ignored entirely; above it a dense short repeat is caught |
 | `STREAM_MIN_CHARS` | `400` (env `ANTI_SPIRAL_STREAM_MIN_CHARS`) | mid-stream: text length before the first check |
 | `STREAM_STEP` | `200` | mid-stream: re-check every N characters of growth |
 | `TAIL_WORDS` / `TAIL_LINES` | `150` / `12` | size of the tail window |
-| `STATE_VERSION` | `3` | bump to invalidate every stored counter |
+| `STATE_VERSION` | `4` | bump to invalidate every stored counter |
 
 Coverage thresholds live in the `[8,7,6,5,4,3]` loop in `detectSpiral()`; the tic
 thresholds in `detectTic()`.
@@ -180,16 +205,23 @@ thresholds in `detectTic()`.
 node test/anti-spiral.test.mjs
 ```
 
-39 cases driving the real module — the transform hook through synthetic message arrays, and
+49 cases driving the real module — the transform hook through synthetic message arrays, and
 the event hook through a streamed sequence of `message.part.updated` events against a fake
 client that records `abort` / `prompt` / `showToast` calls. Covers the real spiral shapes
 (the 1006× stream; a 1,000-word reasoning ending in a short-line loop next to a tool call;
 the same with a normal ending), session identity from messages, the mid-stream cut (fires
-on the right session, once per message, never on a user message, never inside an open code
-fence, never on a finished part, never on normal long reasoning), the
-tool-call-does-not-hide-a-loop rule, one-turn-one-count, escalation, stale state and TTL
-pruning — and, in the other direction, code blocks, log dumps, prose that reuses common
-phrases, short and empty messages all staying silent.
+on the right session, once per message, never on a known user message, never while a
+part's role is still unknown *and static*, never inside an open code fence, never on a
+finished part, never on normal long reasoning), the tool-call-does-not-hide-a-loop rule,
+one-turn-one-count, escalation, stale state and TTL pruning — and, in the other direction,
+code blocks, log dumps, prose that reuses common phrases, short and empty messages all
+staying silent.
+
+Three sections were added after the 2026-09-14 spiral, each pinning a v3 escape: **the
+tool-call spiral** (consecutive looping tool turns reach the halt instead of resetting it),
+**the rate trip** (five detections with a clean turn between each still halt), and **the
+short looping turn** (an 8-word repeat that `MIN_WORDS` used to skip). The stale-state
+section separately pins that a `v: 3` file is not resumed.
 
 `ANTI_SPIRAL_PLUGIN=/path/to/anti-spiral.js` points the suite at a different copy (useful
 for checking an installed plugin).

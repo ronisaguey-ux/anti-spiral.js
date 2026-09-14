@@ -1,5 +1,34 @@
 // anti-spiral.js — opencode plugin: catches genuine reasoning loops and stops them.
 //
+// v4. What v3 got wrong, measured on a real 15-minute spiral (09-14, 34,576 chars,
+// reasoning tics "Let me act." x176 / "OK." x163 / "Let me make the call." x133):
+//
+//   1. THE TOOL-CALL SPIRAL WAS IMMUNE. The turn hook reset the escalation counter
+//      whenever the turn contained a tool call, so a spiral that kept *making* calls
+//      ("Let me act." + one Read, 20 seconds apart) zeroed its own counter forever.
+//      It was detected 18 times in 15 minutes and never escalated past a redirect.
+//      FIX: a separate `toolLoops` counter (a clean tool turn still resets).
+//   2. LAYER 1 COULD NOT FIRE AT ALL. Replaying the real spiral through the detector
+//      shows the mid-stream check trips at 3,600 chars (10% in) — yet the live journal
+//      has ZERO "MID-STREAM CUT" lines, because layer 1 gated every part behind a role
+//      map fed by `message.updated`, and a part whose role was never seen was silently
+//      skipped. FIX: a reasoning part is assistant by construction (only assistants
+//      emit reasoning), so it is judged directly; for text parts an unknown role must
+//      first show real stream growth, which a static user message can never do.
+//   3. EVERY DETECTION WAS FORGETTABLE. Resetting counters is what let 18 detections
+//      pass for silence. FIX: a rate trip — RATE_LIMIT detections inside RATE_WINDOW_MS
+//      halts the session regardless of what the counters were reset to. Hits are never
+//      cleared by hand; the rolling window is the only thing that forgets, because one
+//      clean turn between two loops is precisely the pattern that survived v3.
+//   4. SHORT LOOPING TURNS WERE INVISIBLE. `MIN_WORDS = 40` returned early, so a
+//      three-line "Let me act." turn (9 words, 100% repetition) scored null. FIX:
+//      a short-text path that judges repeated n-grams by coverage, not by length.
+//
+// v4 measured (test/run.mjs): 3 consecutive looping turns -> HALT on the third; 5
+// detections in 5 minutes -> HALT even with every counter reset between them; 20
+// clean tool-call turns -> 0 detections; the real 34,576-char spiral -> HALT on
+// turn 4, 17% in, about a minute of wall clock instead of fifteen.
+//
 // v3. Two independent layers, because v2 had one and it missed a 26,000-character
 // "Let me go. / Let me read." spiral in a single DeepSeek reasoning stream:
 //
@@ -48,14 +77,21 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs"
 import path from "node:path"
 import os from "node:os"
 
-const VERSION = "v3"
+const VERSION = "v4"
 const STATE_DIR =
   process.env.ANTI_SPIRAL_STATE_DIR ||
   path.join(os.homedir(), ".local", "share", "opencode", "anti-spiral")
 const STATE_FILE = path.join(STATE_DIR, "state.json")
-const STATE_VERSION = 3 // bump invalidates counters written by an older detector
+const STATE_VERSION = 4 // bump invalidates counters written by an older detector
 const FREEZE_AFTER = 3
 const MIN_WORDS = 40
+const MIN_SHORT_WORDS = 8 // below MIN_WORDS but still judgeable (short looping turn)
+
+// Rate trip: the escape hatch a counter-reset spiral used to walk through. 18
+// detections in 15 minutes stayed a redirect because each one reset a counter;
+// five inside five minutes halts no matter what the counters say.
+const RATE_WINDOW_MS = 5 * 60 * 1000
+const RATE_LIMIT = 5
 
 // Mid-stream: don't judge a stream before it has this much text, then re-check
 // every STREAM_STEP characters of growth (cheap: the check is O(tail)).
@@ -190,12 +226,27 @@ function detectTailLoop(text) {
   return null
 }
 
+// A short turn that is almost entirely one repeated unit. "Let me act." repeated
+// three times is nine words and 100% repetition — far more loop-like than a long
+// message that happens to reuse a phrase — but v3 returned null on it for being
+// under MIN_WORDS, so those turns reset the counter instead of feeding it.
+function detectShortSpiral(text, words) {
+  if (words.length < MIN_SHORT_WORDS) return null
+  for (const n of [5, 4, 3, 2]) {
+    const { best, count, coverage } = ngramCoverage(words, n)
+    if (count >= 3 && coverage >= 0.5) {
+      return { kind: "short", phrase: best, count, coverage }
+    }
+  }
+  return null
+}
+
 // Returns null when the text is not a loop, otherwise the evidence for the redirect.
 function detectSpiral(rawText) {
   if (!rawText) return null
   const text = stripNonProse(rawText)
   const words = normalizeWords(text)
-  if (words.length < MIN_WORDS) return null
+  if (words.length < MIN_WORDS) return detectShortSpiral(text, words)
 
   // 1. The same sentence twice in a row.
   const sentences = sentencesOf(text)
@@ -241,7 +292,11 @@ function detectSpiral(rawText) {
 function loadState() {
   try {
     const s = JSON.parse(readFileSync(STATE_FILE, "utf8"))
-    return s && typeof s === "object" ? s : {}
+    if (!s || typeof s !== "object") return {}
+    // Counters from an older detector mean different things (v3 had no toolLoops
+    // and no rate trip), so they start from zero rather than being resumed.
+    if (s.v !== STATE_VERSION) return {}
+    return s
   } catch (_) {
     return {}
   }
@@ -274,12 +329,29 @@ function sessionRow(state, sessionID) {
     state.sessions = {}
   }
   if (!state.sessions) state.sessions = {}
-  if (!state.sessions[sessionID]) state.sessions[sessionID] = { loops: 0, aborts: 0 }
+  if (!state.sessions[sessionID]) state.sessions[sessionID] = { loops: 0, aborts: 0, toolLoops: 0, hits: [] }
   const s = state.sessions[sessionID]
   if (!Number.isFinite(s.loops)) s.loops = 0
   if (!Number.isFinite(s.aborts)) s.aborts = 0
+  // 09-14: consecutive turns that looped WHILE making a tool call. Kept separate
+  // from `loops` because a clean tool-call turn must still reset everything.
+  if (!Number.isFinite(s.toolLoops)) s.toolLoops = 0
+  // Detection timestamps inside RATE_WINDOW_MS. Survives every counter reset: if
+  // the session keeps producing loops at this rate it is spiralling, whatever the
+  // individual counters were talked into.
+  if (!Array.isArray(s.hits)) s.hits = []
   s.t = Date.now()
   return s
+}
+
+// Records one detection and says whether the rate trip is now tripped. Hits are
+// never cleared by hand — the rolling window is the only thing that forgets, so a
+// spiral that alternates good turns with bad ones still trips it.
+function recordHit(s, now = Date.now()) {
+  s.hits = (s.hits || []).filter(t => Number.isFinite(t) && now - t < RATE_WINDOW_MS)
+  s.hits.push(now)
+  if (s.hits.length > 200) s.hits = s.hits.slice(-200)
+  return s.hits.length
 }
 
 // ── message helpers ────────────────────────────────────────────────────────
@@ -354,6 +426,10 @@ function syntheticMsg(text, messages, sessionID) {
 // ── redirect messages ──────────────────────────────────────────────────────
 
 function describe(evidence) {
+  if (evidence.kind === "short") {
+    const pct = Math.round((evidence.coverage || 0) * 100)
+    return `"${evidence.phrase}" repeated ${evidence.count}x (${pct}% of a short turn)`
+  }
   if (evidence.kind === "sentence") return `the same sentence twice in a row: "${evidence.phrase}"`
   if (evidence.kind === "line") return `this line ${evidence.count}x: "${evidence.phrase}"`
   if (evidence.kind === "tic") return `the line "${evidence.phrase}" on its own ${evidence.count}x — narrating the next step instead of taking it`
@@ -362,7 +438,7 @@ function describe(evidence) {
   return `"${evidence.phrase}" repeated ${evidence.count}x (${pct}%${where})`
 }
 
-function redirectMsg(count, evidence) {
+function redirectMsg(count, evidence, tool) {
   return `[anti-spiral] Repetition detected in your last turn — ${describe(evidence)}.
 
 That is the loop signature: the same unit restated instead of advanced. Nothing here
@@ -376,12 +452,16 @@ Do exactly one of these, in this turn:
 Do not restate the plan. Do not re-explain what you are about to do. Do not write
 "let me" — call the tool. Act.
 
-(loop ${count}/${FREEZE_AFTER} — three consecutive turns with no tool call and repeated
-text will halt narration until a tool call is made.)`
+(loop ${count}/${FREEZE_AFTER} — ${tool
+    ? "a third turn like this one halts narration. Make the call; do not narrate the call."
+    : "three consecutive turns with no tool call and repeated text halt narration."})`
 }
 
-function freezeMsg(count, evidence) {
-  return `[anti-spiral] HALT — ${count} consecutive turns with repeated text and no tool call.
+function freezeMsg(count, evidence, rate) {
+  const why = rate && rate >= RATE_LIMIT
+    ? `${rate} loops detected in the last ${Math.round(RATE_WINDOW_MS / 60000)} minutes`
+    : `${count} consecutive turns with repeated text`
+  return `[anti-spiral] HALT — ${why}.
 Last repetition: ${describe(evidence)}.
 
 Narration is paused until real progress happens. Your next turn must be a tool call,
@@ -413,15 +493,24 @@ and stop.
 
 export async function AntiSpiral(input) {
   const client = input?.client
-  console.log(`[anti-spiral] loaded — loop detector ${VERSION} (mid-stream kill switch + turn review)`)
+  console.log(`[anti-spiral] loaded — loop detector ${VERSION} (mid-stream kill switch + turn review, halt on ${FREEZE_AFTER} straight or ${RATE_LIMIT} in ${Math.round(RATE_WINDOW_MS / 60000)}min)`)
 
-  // Layer 1 bookkeeping. roles: messageID -> role (assistant parts are the only ones
-  // judged; a user pasting a spiral into the prompt must never abort their own
-  // session). streams: partID -> last length judged. cut: messageIDs already aborted.
+  // Layer 1 bookkeeping. roles: messageID -> role (a user pasting a spiral into the
+  // prompt must never abort their own session — but v3 gated on the role map alone,
+  // and when message.updated never populated it every part was skipped in silence,
+  // which is why a 15-minute spiral produced zero cuts). streams: partID -> last
+  // length judged. cut: messageIDs already aborted. diag: what layer 1 actually saw.
   const roles = new Map()
   const streams = new Map()
   const cut = new Set()
   const bound = (m, max) => { if (m.size > max) { const first = m.keys().next().value; m.delete(first) } }
+  const diag = { seen: 0, finished: 0, reasoning: 0, text: 0, roleKnown: 0, roleUnknown: 0, user: 0, judged: 0, cuts: 0 }
+  function flushDiag() {
+    if (diag.seen < 200) return
+    console.log(`[anti-spiral] stream diag — parts=${diag.seen} finished=${diag.finished} reasoning=${diag.reasoning} text=${diag.text} roleKnown=${diag.roleKnown} roleUnknown=${diag.roleUnknown} user=${diag.user} judged=${diag.judged} cuts=${diag.cuts}`)
+    diag.seen = diag.finished = diag.reasoning = diag.text = 0
+    diag.roleKnown = diag.roleUnknown = diag.user = diag.judged = 0
+  }
 
   async function cutStream(part, evidence) {
     const sessionID = part.sessionID
@@ -433,9 +522,11 @@ export async function AntiSpiral(input) {
     const s = sessionRow(state, sessionID)
     s.aborts += 1
     s.loops += 1
+    const rate = recordHit(s)
     s.lastMsg = messageID
     saveState(state)
-    console.log(`[anti-spiral] MID-STREAM CUT #${s.aborts} (session=${sessionID}, msg=${messageID}, ${evidence.count}x "${String(evidence.phrase).slice(0, 60)}")`)
+    diag.cuts += 1
+    console.log(`[anti-spiral] MID-STREAM CUT #${s.aborts} rate=${rate}/${RATE_LIMIT} (session=${sessionID}, msg=${messageID}, ${evidence.count}x "${String(evidence.phrase).slice(0, 60)}")`)
 
     if (!client) return
     try {
@@ -452,7 +543,8 @@ export async function AntiSpiral(input) {
     } catch (_) {}
     // Give the abort a moment to settle before the redirect opens a new turn.
     await new Promise(r => setTimeout(r, 400))
-    const text = s.loops >= FREEZE_AFTER ? freezeMsg(s.loops, evidence) : abortMsg(s.aborts, evidence)
+    const halt = s.loops >= FREEZE_AFTER || rate >= RATE_LIMIT
+    const text = halt ? freezeMsg(s.loops, evidence, rate) : abortMsg(s.aborts, evidence)
     try {
       await client.session.prompt({ path: { id: sessionID }, body: { parts: [{ type: "text", text }] } })
     } catch (err) {
@@ -472,16 +564,32 @@ export async function AntiSpiral(input) {
         if (event.type !== "message.part.updated") return
         const part = event.properties?.part
         if (!part || (part.type !== "reasoning" && part.type !== "text")) return
-        if (roles.get(part.messageID) !== "assistant") return
+        diag.seen += 1
+        if (part.time?.end) { diag.finished += 1; streams.delete(part.id); flushDiag(); return } // finished: layer 2 owns it now
+        if (part.type === "reasoning") diag.reasoning += 1; else diag.text += 1
+        const role = roles.get(part.messageID)
+        if (role === "assistant") diag.roleKnown += 1
+        else if (role) { diag.user += 1; flushDiag(); return } // a user message: never cut their own turn
+        else diag.roleUnknown += 1
         if (cut.has(part.messageID)) return
         const text = partText(part)
-        if (part.time?.end) { streams.delete(part.id); return } // finished: layer 2 owns it now
-        if (text.length < STREAM_MIN_CHARS) return
-        const seen = streams.get(part.id) || 0
-        if (text.length - seen < STREAM_STEP) return
+        const seen = streams.get(part.id)
+        // Reasoning exists only on assistant messages, so it is safe to judge at once.
+        // Text is not: without a role, a long static user paste is indistinguishable
+        // from an assistant stream already in flight. Such a part is judged only after
+        // it is seen to GROW, so its first sighting just records a length to compare
+        // against — a user paste is written once and never grows.
+        if (part.type !== "reasoning" && role !== "assistant" && seen === undefined) {
+          if (text.length) { streams.set(part.id, text.length); bound(streams, 500) }
+          flushDiag(); return
+        }
+        if (text.length < STREAM_MIN_CHARS) { flushDiag(); return }
+        if (seen !== undefined && text.length - seen < STREAM_STEP) { flushDiag(); return }
         streams.set(part.id, text.length); bound(streams, 500)
+        diag.judged += 1
         const evidence = detectTailLoop(stripStreaming(text))
         if (evidence) await cutStream(part, evidence)
+        flushDiag()
       } catch (err) {
         try { console.error("[anti-spiral] event error:", String(err?.message || err)) } catch (_) {}
       }
@@ -503,26 +611,57 @@ export async function AntiSpiral(input) {
         const evidence = detectSpiral(text)
 
         if (usedTool) {
-          // Work happened: escalation resets. A loop in the turn is still called out
-          // — silently clearing it is how the "let me read" habit grew 5x -> 1006x —
-          // but as a one-off redirect that cannot escalate to a halt on its own.
+          if (!evidence) {
+            // Genuine work with no loop: escalation resets. A working agent that
+            // makes tool calls must never be frozen — that was the v2 bug.
+            s.loops = 0
+            s.aborts = 0
+            s.toolLoops = 0
+            s.lastMsg = ""
+            saveState(state)
+            return
+          }
+
+          // 09-14: A LOOP *ALONGSIDE* A TOOL CALL USED TO RESET THE COUNTER, so a
+          // spiral that keeps making tool calls could never escalate. Measured live:
+          // a 15-minute "Let me act. / Let me make the call." spiral was detected
+          // 8 times between 02:02 and 02:17 and every single one logged
+          // "redirect, no escalation" — the counter was zeroed by the very tool call
+          // the spiral was producing. A clean tool-call turn still resets (above);
+          // a LOOPING tool-call turn now accumulates in its own counter.
           s.loops = 0
           s.aborts = 0
-          s.lastMsg = evidence ? msgID : ""
+          s.toolLoops = (s.toolLoops || 0) + 1
+          const rate = recordHit(s)
+          s.lastMsg = msgID
           saveState(state)
-          if (evidence) {
-            console.log(`[anti-spiral] loop alongside a tool call (session=${sessionID}, ${evidence.kind}) — redirect, no escalation`)
-            output.messages.push(syntheticMsg(redirectMsg(1, evidence), output.messages, sessionID))
+          // Two ways to halt: three consecutive looping tool-turns, or five drifting
+          // turns in five minutes however many of them got their counter reset.
+          const halt = s.toolLoops >= FREEZE_AFTER || rate >= RATE_LIMIT
+          if (halt) {
+            console.log(`[anti-spiral] TOOL-CALL LOOP #${s.toolLoops} rate=${rate}/${RATE_LIMIT} (session=${sessionID}, ${evidence.kind}) — halting`)
+            output.messages.push(syntheticMsg(freezeMsg(s.toolLoops, evidence, rate), output.messages, sessionID))
+          } else {
+            console.log(`[anti-spiral] loop alongside a tool call #${s.toolLoops}/${FREEZE_AFTER} rate=${rate}/${RATE_LIMIT} (session=${sessionID}, ${evidence.kind}) — redirect`)
+            output.messages.push(syntheticMsg(redirectMsg(s.toolLoops, evidence, true), output.messages, sessionID))
           }
           return
         }
+        // a non-tool turn that is NOT looping also clears the consecutive tool-call
+        // counter. It deliberately does NOT clear the rate-trip hits: one clean turn
+        // between two loops is exactly how v3's spirals survived. Hits expire only
+        // by falling out of the rolling window, which is what makes the trip
+        // un-forgettable.
+        if (!evidence && s.toolLoops) s.toolLoops = 0
 
         if (evidence) {
           s.loops++
+          const rate = recordHit(s)
           s.lastMsg = msgID
           saveState(state)
-          console.log(`[anti-spiral] loop #${s.loops} (session=${sessionID}, ${evidence.kind})`)
-          const msg = s.loops >= FREEZE_AFTER ? freezeMsg(s.loops, evidence) : redirectMsg(s.loops, evidence)
+          const halt = s.loops >= FREEZE_AFTER || rate >= RATE_LIMIT
+          console.log(`[anti-spiral] loop #${s.loops} rate=${rate}/${RATE_LIMIT} (session=${sessionID}, ${evidence.kind})${halt ? " — halting" : ""}`)
+          const msg = halt ? freezeMsg(s.loops, evidence, rate) : redirectMsg(s.loops, evidence)
           output.messages.push(syntheticMsg(msg, output.messages, sessionID))
         } else if (s.loops > 0 || s.aborts > 0) {
           s.loops = 0
